@@ -35,9 +35,12 @@ type Run = {
     priority: number | null;
     workday_only: boolean;
     active: boolean;
+
     schedule_kind?: string | null;
     due_day?: number | null;
     due_weekday?: number | null;
+    schedule_every?: number | null;
+    anchor_date?: string | null;
   } | null;
 };
 
@@ -69,7 +72,6 @@ function daysInMonth(year: number, month1to12: number) {
 }
 
 function nthWorkdayOfMonth(year: number, month1to12: number, n: number) {
-  // retorna YYYY-MM-DD do n-ésimo dia útil (Mon-Fri) do mês
   let count = 0;
   for (let day = 1; day <= daysInMonth(year, month1to12); day++) {
     const iso = `${year}-${String(month1to12).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
@@ -82,13 +84,32 @@ function nthWorkdayOfMonth(year: number, month1to12: number, n: number) {
   return null;
 }
 
+function diffDays(a: string, b: string) {
+  const da = new Date(a + "T00:00:00").getTime();
+  const db = new Date(b + "T00:00:00").getTime();
+  return Math.floor((db - da) / (1000 * 60 * 60 * 24));
+}
+
+function monthDiff(a: string, b: string) {
+  const da = new Date(a + "T00:00:00");
+  const db = new Date(b + "T00:00:00");
+  return (db.getFullYear() - da.getFullYear()) * 12 + (db.getMonth() - da.getMonth());
+}
+
+function weekIndexFrom(iso: string) {
+  // semana baseada em segunda-feira
+  const d = new Date(iso + "T00:00:00");
+  const day = d.getDay(); // 0..6
+  const deltaToMon = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + deltaToMon);
+  return Math.floor(d.getTime() / (1000 * 60 * 60 * 24 * 7));
+}
+
 export default function RunsPage() {
   const router = useRouter();
 
   const [loading, setLoading] = useState(true);
-  const [userId, setUserId] = useState<string>("");
   const [errorMsg, setErrorMsg] = useState<string>("");
-
   const [runs, setRuns] = useState<Run[]>([]);
 
   async function loadRuns() {
@@ -107,13 +128,11 @@ export default function RunsPage() {
       router.replace("/login");
       return;
     }
-    setUserId(u.id);
 
-    // join com templates para mostrar info
     const { data, error } = await supabase
       .from("task_runs")
       .select(
-        "*, task_templates(task_id,title,sector,task_type,frequency,priority,workday_only,active,schedule_kind,due_day,due_weekday)"
+        "*, task_templates(task_id,title,sector,task_type,frequency,priority,workday_only,active,schedule_kind,due_day,due_weekday,schedule_every,anchor_date)"
       )
       .order("due_date", { ascending: true });
 
@@ -127,8 +146,7 @@ export default function RunsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Geração real: cria runs para os próximos 30 dias respeitando schedule_kind
-  async function generateRunsMVP() {
+  async function generateRuns30d() {
     setErrorMsg("");
 
     const { data: sessData, error: sessErr } = await supabase.auth.getSession();
@@ -136,22 +154,19 @@ export default function RunsPage() {
 
     const u = sessData.session?.user;
     if (!u) return router.replace("/login");
-
     const uid = u.id;
 
-    // Busca templates ativos + regras
     const { data: templates, error: tErr } = await supabase
       .from("task_templates")
-      .select("id, user_id, workday_only, active, schedule_kind, due_day, due_weekday")
+      .select("id,user_id,active,workday_only,schedule_kind,due_day,due_weekday,schedule_every,anchor_date")
       .eq("active", true);
 
     if (tErr) return setErrorMsg(tErr.message);
 
     const start = todayISO();
     const days = 30;
-
-    // pega runs já existentes no range (para evitar duplicar)
     const end = addDays(start, days);
+
     const { data: existing, error: eErr } = await supabase
       .from("task_runs")
       .select("template_id, due_date")
@@ -167,41 +182,55 @@ export default function RunsPage() {
     const inserts: any[] = [];
 
     for (const t of (templates || []) as any[]) {
-      // RLS: só pode inserir pra você mesmo
       if (t.user_id !== uid) continue;
 
       const kind = (t.schedule_kind || "monthly") as string;
       const dueDay = typeof t.due_day === "number" ? t.due_day : null;
       const dueWk = typeof t.due_weekday === "number" ? t.due_weekday : null;
 
+      const every =
+        typeof t.schedule_every === "number" && t.schedule_every > 0 ? t.schedule_every : 1;
+
+      const anchor = (t.anchor_date as string) || start;
+
       for (let i = 0; i <= days; i++) {
         const d = addDays(start, i);
+
         let shouldCreate = false;
 
         if (kind === "daily") {
-          shouldCreate = true;
-        } else if (kind === "weekly") {
-          if (dueWk && weekday1to7(d) === dueWk) shouldCreate = true;
-        } else if (kind === "monthly") {
-          // due_day = dia do mês, ou se workday_only=true, due_day = nº dia útil
-          const dt = new Date(d + "T00:00:00");
-          const year = dt.getFullYear();
-          const month = dt.getMonth() + 1;
+          const dd = diffDays(anchor, d);
+          shouldCreate = dd >= 0 && dd % every === 0;
 
-          if (dueDay) {
+        } else if (kind === "weekly") {
+          if (dueWk && weekday1to7(d) === dueWk) {
+            const wa = weekIndexFrom(anchor);
+            const wd = weekIndexFrom(d);
+            const diff = wd - wa;
+            shouldCreate = diff >= 0 && diff % every === 0;
+          }
+
+        } else if (kind === "monthly") {
+          const md = monthDiff(anchor, d);
+          if (md >= 0 && md % every === 0 && dueDay) {
+            const dt = new Date(d + "T00:00:00");
+            const year = dt.getFullYear();
+            const month = dt.getMonth() + 1;
+
             if (t.workday_only) {
               const nth = nthWorkdayOfMonth(year, month, dueDay);
-              if (nth === d) shouldCreate = true;
+              shouldCreate = nth === d;
             } else {
               const dim = daysInMonth(year, month);
               if (dueDay <= dim) {
                 const isoDue = `${year}-${String(month).padStart(2, "0")}-${String(dueDay).padStart(2, "0")}`;
-                if (isoDue === d) shouldCreate = true;
+                shouldCreate = isoDue === d;
               }
             }
           }
+
         } else if (kind === "once") {
-          // MVP: cria só no dia definido (due_day) dentro do range
+          // se vier histórico do Excel, ele entra por upsert (import). Aqui é só “geração automática”.
           if (dueDay) {
             const dt = new Date(d + "T00:00:00");
             const year = dt.getFullYear();
@@ -209,7 +238,7 @@ export default function RunsPage() {
             const dim = daysInMonth(year, month);
             if (dueDay <= dim) {
               const isoOnce = `${year}-${String(month).padStart(2, "0")}-${String(dueDay).padStart(2, "0")}`;
-              if (isoOnce === d) shouldCreate = true;
+              shouldCreate = isoOnce === d;
             }
           }
         }
@@ -217,7 +246,7 @@ export default function RunsPage() {
         if (!shouldCreate) continue;
 
         const key = `${t.id}|${d}`;
-        if (existingSet.has(key)) continue; // já existe
+        if (existingSet.has(key)) continue;
 
         inserts.push({
           user_id: uid,
@@ -236,15 +265,11 @@ export default function RunsPage() {
       return;
     }
 
-    // Insere em lotes pra não estourar limite
     const chunkSize = 200;
     for (let i = 0; i < inserts.length; i += chunkSize) {
       const chunk = inserts.slice(i, i + chunkSize);
       const { error } = await supabase.from("task_runs").insert(chunk);
-      if (error) {
-        setErrorMsg(error.message);
-        return;
-      }
+      if (error) return setErrorMsg(error.message);
     }
 
     await loadRuns();
@@ -273,10 +298,10 @@ export default function RunsPage() {
             <div>
               <CardTitle>Runs (Vencimentos)</CardTitle>
               <div className="text-xs opacity-70">
-                Generate runs based on template schedules (daily/weekly/monthly/once).
+                Generate runs based on schedules (daily/weekly/monthly/once + intervals).
               </div>
             </div>
-            <Button onClick={generateRunsMVP}>Generate runs (30d)</Button>
+            <Button onClick={generateRuns30d}>Generate runs (30d)</Button>
           </CardHeader>
 
           <CardContent className="space-y-3">
@@ -334,15 +359,6 @@ export default function RunsPage() {
                 </TableBody>
               </Table>
             </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>Next step</CardTitle>
-          </CardHeader>
-          <CardContent className="text-sm opacity-80">
-            Próximo passo: colocar isso no ar (Vercel) e depois criar a importação do Excel (templates + runs).
           </CardContent>
         </Card>
       </div>
