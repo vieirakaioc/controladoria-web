@@ -18,7 +18,6 @@ function norm(v: any) {
 function toISODate(v: any): string | null {
   if (!v) return null;
 
-  // Date
   if (v instanceof Date && !isNaN(v.getTime())) {
     const yyyy = v.getFullYear();
     const mm = String(v.getMonth() + 1).padStart(2, "0");
@@ -26,7 +25,6 @@ function toISODate(v: any): string | null {
     return `${yyyy}-${mm}-${dd}`;
   }
 
-  // Excel serial
   if (typeof v === "number") {
     const d = XLSX.SSF.parse_date_code(v);
     if (!d) return null;
@@ -36,7 +34,6 @@ function toISODate(v: any): string | null {
     return `${yyyy}-${mm}-${dd}`;
   }
 
-  // String
   if (typeof v === "string") {
     const s = v.trim();
     if (!s) return null;
@@ -58,9 +55,9 @@ function toISODate(v: any): string | null {
 function freqToSchedule(freqRaw: string) {
   const f = (freqRaw || "").toLowerCase();
 
-  // defaults “bons” (pra você não ficar travado)
-  // weekly: Friday (5)
-  // monthly: due_day=5 (dia 5 do mês ou 5º dia útil se workday_only=true)
+  // defaults “bons”
+  // weekly: Friday(5)
+  // monthly: due_day=5 (dia 5 do mês / 5º dia útil se workday_only=true)
   if (f.includes("diar")) {
     return { schedule_kind: "daily", schedule_every: 1, due_weekday: null, due_day: null };
   }
@@ -81,6 +78,14 @@ function freqToSchedule(freqRaw: string) {
   }
 
   return { schedule_kind: "monthly", schedule_every: 1, due_weekday: null, due_day: 5 };
+}
+
+function tplKey(planner: string, sector: string, title: string) {
+  return `${planner}|${sector}|${title}`.toLowerCase();
+}
+
+function runKey(templateId: string, dueDate: string) {
+  return `${templateId}|${dueDate}`;
 }
 
 export default function ImportPage() {
@@ -126,8 +131,8 @@ export default function ImportPage() {
 
       append(`Sheet Templates: ${sheetTemplates} (${rowsT.length} linhas)`);
 
-      // Templates
-      const templatesPayload = rowsT
+      // 1) Monta templates brutos
+      const templatesRaw = rowsT
         .map((r) => {
           const planner = norm(r["Planner Name"] || r["Planner"] || r["planner"]);
           const sector = norm(r["Setor"] || r["Sector"] || r["sector"]);
@@ -167,25 +172,57 @@ export default function ImportPage() {
             assignee_name: assignee_name || null,
             assignee_email: assignee_email || null,
 
-            // task_id = null (trigger gera automático)
+            // deixa null: trigger gera automático
             task_id: null,
           };
         })
         .filter(Boolean) as any[];
 
-      append(`Templates preparados: ${templatesPayload.length}`);
+      append(`Templates preparados (bruto): ${templatesRaw.length}`);
 
-      // Upsert templates em lotes
+      // 2) DEDUPLICAR templates (pra não quebrar o upsert)
+      const tplMap = new Map<string, any>();
+      let tplDup = 0;
+
+      for (const t of templatesRaw) {
+        const k = tplKey(t.planner, t.sector, t.title);
+        if (tplMap.has(k)) {
+          tplDup++;
+
+          // Merge simples: mantém o que já existe, mas preenche campos vazios com o novo
+          const prev = tplMap.get(k);
+          tplMap.set(k, {
+            ...prev,
+            task_type: prev.task_type ?? t.task_type,
+            notes: prev.notes ?? t.notes,
+            priority: prev.priority ?? t.priority,
+            frequency: prev.frequency ?? t.frequency,
+            classification: prev.classification ?? t.classification,
+            assignee_name: prev.assignee_name ?? t.assignee_name,
+            assignee_email: prev.assignee_email ?? t.assignee_email,
+          });
+        } else {
+          tplMap.set(k, t);
+        }
+      }
+
+      const templatesPayload = Array.from(tplMap.values());
+      append(`Templates deduplicados: ${templatesPayload.length} (removidos: ${tplDup})`);
+
+      // 3) Upsert templates em lotes
       const chunkSize = 200;
       for (let i = 0; i < templatesPayload.length; i += chunkSize) {
         const chunk = templatesPayload.slice(i, i + chunkSize);
+
         const { error } = await supabase
           .from("task_templates")
           .upsert(chunk, { onConflict: "user_id,planner,sector,title" });
 
         if (error) throw new Error(error.message);
 
-        append(`Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`);
+        append(
+          `Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`
+        );
       }
 
       append("Buscando IDs dos templates pra mapear runs...");
@@ -198,14 +235,12 @@ export default function ImportPage() {
 
       const map = new Map<string, string>();
       (allTemplates || []).forEach((t: any) => {
-        map.set(`${t.planner}|${t.sector}|${t.title}`, t.id);
+        map.set(tplKey(t.planner, t.sector, t.title), t.id);
       });
 
-      // Runs/histórico
+      // 4) Runs/histórico
       let runsRows: Row[] = [];
-
-      const sheetRuns =
-        wb.SheetNames.find((n) => ["Runs", "Execucoes", "Execuções"].includes(n)) || "";
+      const sheetRuns = wb.SheetNames.find((n) => ["Runs", "Execucoes", "Execuções"].includes(n)) || "";
 
       if (sheetRuns) {
         const wsR = wb.Sheets[sheetRuns];
@@ -216,15 +251,14 @@ export default function ImportPage() {
         append("Runs: usando as datas da própria Lista (se existirem).");
       }
 
-      const runsPayload = runsRows
+      const runsRaw = runsRows
         .map((r) => {
           const planner = norm(r["Planner Name"] || r["Planner"] || r["planner"]);
           const sector = norm(r["Setor"] || r["Sector"] || r["sector"]);
           const title = norm(r["Atividade"] || r["Title"] || r["title"]);
-
           if (!planner || !sector || !title) return null;
 
-          const template_id = map.get(`${planner}|${sector}|${title}`);
+          const template_id = map.get(tplKey(planner, sector, title));
           if (!template_id) return null;
 
           const start_date = toISODate(r["Data Inicial"] || r["Start Date"] || r["start_date"]);
@@ -235,9 +269,7 @@ export default function ImportPage() {
 
           const statusRaw = norm(r["Status"] || "");
           const status =
-            done_date || statusRaw.toLowerCase().includes("concl")
-              ? "done"
-              : "open";
+            done_date || statusRaw.toLowerCase().includes("concl") ? "done" : "open";
 
           return {
             user_id: u.id,
@@ -251,7 +283,36 @@ export default function ImportPage() {
         })
         .filter(Boolean) as any[];
 
-      append(`Runs detectadas (com due_date): ${runsPayload.length}`);
+      append(`Runs detectadas (bruto, com due_date): ${runsRaw.length}`);
+
+      // 5) DEDUPLICAR runs (template_id + due_date)
+      const runMap = new Map<string, any>();
+      let runDup = 0;
+
+      for (const r of runsRaw) {
+        const k = runKey(r.template_id, r.due_date);
+        if (runMap.has(k)) {
+          runDup++;
+
+          // merge: se alguma linha tiver done_at/status done, prioriza isso
+          const prev = runMap.get(k);
+          const betterDoneAt = prev.done_at ?? r.done_at;
+          const betterStatus = (prev.status === "done" || r.status === "done") ? "done" : "open";
+
+          runMap.set(k, {
+            ...prev,
+            start_date: prev.start_date ?? r.start_date,
+            done_at: betterDoneAt,
+            status: betterStatus,
+            notes: prev.notes ?? r.notes,
+          });
+        } else {
+          runMap.set(k, r);
+        }
+      }
+
+      const runsPayload = Array.from(runMap.values());
+      append(`Runs deduplicadas: ${runsPayload.length} (removidos: ${runDup})`);
 
       if (runsPayload.length > 0) {
         for (let i = 0; i < runsPayload.length; i += chunkSize) {
