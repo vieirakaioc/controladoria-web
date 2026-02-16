@@ -11,6 +11,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
@@ -19,9 +20,10 @@ import {
   LayoutDashboard,
   CalendarCheck2,
   ListChecks,
-  Upload,
+  ClipboardList,
   Menu,
   LogOut,
+  Plus,
 } from "lucide-react";
 
 function cx(...classes: Array<string | false | null | undefined>) {
@@ -34,30 +36,45 @@ type NavItem = {
   icon: any;
 };
 
+function isActivePath(pathname: string | null, href: string) {
+  if (!pathname) return false;
+  if (href === "/") return pathname === "/";
+  return pathname === href || pathname.startsWith(href + "/");
+}
+
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
 
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [userEmail, setUserEmail] = useState<string>("");
+  const [loggingOut, setLoggingOut] = useState(false);
 
+  // ✅ Menu do APP (logado)
+  // /import fica fora do shell (rota pública/utility), então não entra aqui
   const navItems: NavItem[] = useMemo(
     () => [
       { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
       { href: "/runs", label: "Runs", icon: CalendarCheck2 },
       { href: "/templates", label: "Templates", icon: ListChecks },
-      { href: "/import", label: "Import", icon: Upload },
+      { href: "/tasks", label: "Tasks", icon: ClipboardList },
     ],
     []
   );
 
   async function checkSession() {
-    const { data } = await supabase.auth.getSession();
+    const { data, error } = await supabase.auth.getSession();
+    if (error) {
+      router.replace("/login");
+      return;
+    }
+
     const u = data.session?.user;
     if (!u) {
       router.replace("/login");
       return;
     }
+
     setUserEmail(u.email || "");
     setCheckingAuth(false);
   }
@@ -74,16 +91,21 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   }, []);
 
   async function logout() {
-    await supabase.auth.signOut();
-    router.replace("/login");
+    if (loggingOut) return;
+    setLoggingOut(true);
+    try {
+      await supabase.auth.signOut();
+      router.replace("/login");
+    } finally {
+      setLoggingOut(false);
+    }
   }
 
   function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
     return (
       <nav className="space-y-1">
         {navItems.map((item) => {
-          const active =
-            pathname === item.href || pathname?.startsWith(item.href + "/");
+          const active = isActivePath(pathname, item.href);
           const Icon = item.icon;
 
           return (
@@ -109,18 +131,22 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 
   if (checkingAuth) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-sm opacity-70">
-        Loading...
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="rounded-lg border px-4 py-3 text-sm opacity-80">
+          Loading workspace...
+        </div>
       </div>
     );
   }
+
+  const userInitial = (userEmail?.[0] || "U").toUpperCase();
 
   return (
     <div className="min-h-screen bg-background">
       {/* Topbar */}
       <header className="sticky top-0 z-40 border-b bg-background/80 backdrop-blur">
         <div className="mx-auto max-w-7xl px-4 h-14 flex items-center justify-between">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-3">
             {/* Mobile menu */}
             <div className="md:hidden">
               <Sheet>
@@ -129,39 +155,61 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
                     <Menu className="h-4 w-4" />
                   </Button>
                 </SheetTrigger>
+
                 <SheetContent side="left" className="w-72">
-                  <div className="font-semibold mb-4">Controladoria</div>
-                  <NavLinks />
+                  <div className="flex items-center justify-between mb-4">
+                    <div className="font-semibold">Controladoria</div>
+                    <div className="text-xs opacity-60">v0</div>
+                  </div>
+
+                  <NavLinks onNavigate={() => {}} />
                 </SheetContent>
               </Sheet>
             </div>
 
-            <div className="font-semibold">Controladoria</div>
+            <Link href="/dashboard" className="font-semibold">
+              Controladoria <span className="text-xs opacity-60 ml-2">v0</span>
+            </Link>
           </div>
 
           <div className="flex items-center gap-2">
-            <Button variant="outline" onClick={() => router.push("/templates")}>
-              + New template
+            {/* CTA principal */}
+            <Button
+              variant="outline"
+              className="gap-2"
+              onClick={() => router.push("/templates/new")}
+            >
+              <Plus className="h-4 w-4" />
+              <span className="hidden sm:inline">New template</span>
+              <span className="sm:hidden">New</span>
             </Button>
 
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <Button variant="outline" className="gap-2">
                   <Avatar className="h-6 w-6">
-                    <AvatarFallback>
-                      {(userEmail?.[0] || "U").toUpperCase()}
-                    </AvatarFallback>
+                    <AvatarFallback>{userInitial}</AvatarFallback>
                   </Avatar>
+
                   <span className="hidden sm:inline text-xs opacity-80 max-w-[220px] truncate">
                     {userEmail || "User"}
                   </span>
                 </Button>
               </DropdownMenuTrigger>
 
-              <DropdownMenuContent align="end">
-                <DropdownMenuItem onClick={logout} className="gap-2">
+              <DropdownMenuContent align="end" className="min-w-[220px]">
+                <div className="px-2 py-1.5 text-xs opacity-70">
+                  Signed in as
+                  <div className="truncate font-medium opacity-100">
+                    {userEmail || "User"}
+                  </div>
+                </div>
+
+                <DropdownMenuSeparator />
+
+                <DropdownMenuItem onClick={logout} className="gap-2" disabled={loggingOut}>
                   <LogOut className="h-4 w-4" />
-                  Logout
+                  {loggingOut ? "Logging out..." : "Logout"}
                 </DropdownMenuItem>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -177,6 +225,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
             <div className="rounded-lg border p-3">
               <div className="text-xs opacity-70 mb-2">Navigation</div>
               <NavLinks />
+            </div>
+
+            <div className="mt-3 rounded-lg border p-3 text-xs opacity-70">
+              Tip: use <b>Templates</b> pra criar rotinas e <b>Runs</b> pra executar.
             </div>
           </aside>
 
