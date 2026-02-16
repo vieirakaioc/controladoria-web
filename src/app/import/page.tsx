@@ -15,6 +15,13 @@ function norm(v: any) {
   return String(v ?? "").trim();
 }
 
+function asInt(v: any): number | null {
+  const s = String(v ?? "").trim();
+  if (!s) return null;
+  const n = parseInt(s, 10);
+  return Number.isFinite(n) ? n : null;
+}
+
 function toISODate(v: any): string | null {
   if (!v) return null;
 
@@ -52,40 +59,114 @@ function toISODate(v: any): string | null {
   return null;
 }
 
-function freqToSchedule(freqRaw: string) {
-  const f = (freqRaw || "").toLowerCase();
-
-  // defaults “bons”
-  // weekly: Friday(5)
-  // monthly: due_day=5 (dia 5 do mês / 5º dia útil se workday_only=true)
-  if (f.includes("diar")) {
-    return { schedule_kind: "daily", schedule_every: 1, due_weekday: null, due_day: null };
-  }
-  if (f.includes("quinz")) {
-    return { schedule_kind: "weekly", schedule_every: 2, due_weekday: 5, due_day: null };
-  }
-  if (f.includes("seman")) {
-    return { schedule_kind: "weekly", schedule_every: 1, due_weekday: 5, due_day: null };
-  }
-  if (f.includes("bimes")) {
-    return { schedule_kind: "monthly", schedule_every: 2, due_weekday: null, due_day: 5 };
-  }
-  if (f.includes("mens")) {
-    return { schedule_kind: "monthly", schedule_every: 1, due_weekday: null, due_day: 5 };
-  }
-  if (f.includes("pont")) {
-    return { schedule_kind: "once", schedule_every: 1, due_weekday: null, due_day: null };
-  }
-
-  return { schedule_kind: "monthly", schedule_every: 1, due_weekday: null, due_day: 5 };
-}
-
+// chave do template (pra dedup e pra mapear runs)
 function tplKey(planner: string, sector: string, title: string) {
   return `${planner}|${sector}|${title}`.toLowerCase();
 }
-
 function runKey(templateId: string, dueDate: string) {
   return `${templateId}|${dueDate}`;
+}
+
+/**
+ * Mapeia a sua coluna "Frequencia" para regras.
+ * diaUtilN = N do dia útil (ex: 5 = 5º dia útil)
+ * diaSemana = 1..7 (1=Mon .. 7=Sun) (opcional)
+ */
+function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: number | null) {
+  const f = (freqRaw || "").toLowerCase();
+
+  // defaults corporativos
+  const defaultWorkdayN = diaUtilN ?? 5; // se você não preencher, assume 5º dia útil
+  const defaultWeekday = diaSemana ?? 5; // se não preencher, assume sexta
+
+  // diária (por padrão a gente considera "dia útil" como Mon-Fri)
+  if (f.includes("diár") || f.includes("diar")) {
+    return {
+      schedule_kind: "daily",
+      schedule_every: 1,
+      due_weekday: null,
+      due_day: null,
+      workday_only: true, // diária = só dias úteis (Mon-Fri)
+    };
+  }
+
+  // semanal / quinzenal
+  if (f.includes("quinz")) {
+    return {
+      schedule_kind: "weekly",
+      schedule_every: 2,
+      due_weekday: defaultWeekday,
+      due_day: null,
+      workday_only: false,
+    };
+  }
+  if (f.includes("seman")) {
+    return {
+      schedule_kind: "weekly",
+      schedule_every: 1,
+      due_weekday: defaultWeekday,
+      due_day: null,
+      workday_only: false,
+    };
+  }
+
+  // mensal / bimestral / trimestral / anual (sempre por dia útil N)
+  if (f.includes("bimes")) {
+    return {
+      schedule_kind: "monthly",
+      schedule_every: 2,
+      due_weekday: null,
+      due_day: defaultWorkdayN,
+      workday_only: true,
+    };
+  }
+  if (f.includes("trim")) {
+    return {
+      schedule_kind: "monthly",
+      schedule_every: 3,
+      due_weekday: null,
+      due_day: defaultWorkdayN,
+      workday_only: true,
+    };
+  }
+  if (f.includes("anual")) {
+    return {
+      schedule_kind: "monthly",
+      schedule_every: 12,
+      due_weekday: null,
+      due_day: defaultWorkdayN,
+      workday_only: true,
+    };
+  }
+  if (f.includes("mens")) {
+    return {
+      schedule_kind: "monthly",
+      schedule_every: 1,
+      due_weekday: null,
+      due_day: defaultWorkdayN,
+      workday_only: true,
+    };
+  }
+
+  // pontual
+  if (f.includes("pont")) {
+    return {
+      schedule_kind: "once",
+      schedule_every: 1,
+      due_weekday: null,
+      due_day: null,
+      workday_only: false,
+    };
+  }
+
+  // fallback: mensal dia útil
+  return {
+    schedule_kind: "monthly",
+    schedule_every: 1,
+    due_weekday: null,
+    due_day: defaultWorkdayN,
+    workday_only: true,
+  };
 }
 
 export default function ImportPage() {
@@ -131,24 +212,38 @@ export default function ImportPage() {
 
       append(`Sheet Templates: ${sheetTemplates} (${rowsT.length} linhas)`);
 
-      // 1) Monta templates brutos
+      // 1) Templates brutos
       const templatesRaw = rowsT
         .map((r) => {
           const planner = norm(r["Planner Name"] || r["Planner"] || r["planner"]);
           const sector = norm(r["Setor"] || r["Sector"] || r["sector"]);
           const title = norm(r["Atividade"] || r["Title"] || r["title"]);
-
           if (!planner || !sector || !title) return null;
 
           const task_type = norm(r["Tipo"] || "");
           const notes = norm(r["Notas"] || "");
           const priority = Number.isFinite(Number(r["Prioridade"])) ? Number(r["Prioridade"]) : null;
+
           const frequency = norm(r["Frequencia"] || r["Frequência"] || "");
           const classification = norm(r["Classificação"] || "");
           const assignee_name = norm(r["Responsável"] || "");
-          const assignee_email = norm(r["e-mail responsavel"] || r["email"] || "");
+          const assignee_email = norm(r["e-mail"] || r["e-mail responsavel"] || r["email"] || "");
 
-          const sch = freqToSchedule(frequency);
+          // LÊ O DIA ÚTIL N (sua regra)
+          const diaUtilN =
+            asInt(r["Dia Util"]) ??
+            asInt(r["Dia Útil"]) ??
+            asInt(r["Dia_Util_N"]) ??
+            null;
+
+          // opcional: dia da semana pra semanal (se você criar a coluna)
+          const diaSemana =
+            asInt(r["Dia Semana"]) ??
+            asInt(r["Dia_Semana"]) ??
+            asInt(r["due_weekday"]) ??
+            null;
+
+          const sch = freqToSchedule(frequency, diaUtilN, diaSemana);
 
           return {
             user_id: u.id,
@@ -160,8 +255,9 @@ export default function ImportPage() {
             priority,
             frequency: frequency || null,
             classification: classification || null,
-            workday_only: true,
+
             active: true,
+            workday_only: sch.workday_only,
 
             schedule_kind: sch.schedule_kind,
             schedule_every: sch.schedule_every,
@@ -180,7 +276,7 @@ export default function ImportPage() {
 
       append(`Templates preparados (bruto): ${templatesRaw.length}`);
 
-      // 2) DEDUPLICAR templates (pra não quebrar o upsert)
+      // 2) Dedup templates
       const tplMap = new Map<string, any>();
       let tplDup = 0;
 
@@ -188,18 +284,20 @@ export default function ImportPage() {
         const k = tplKey(t.planner, t.sector, t.title);
         if (tplMap.has(k)) {
           tplDup++;
-
-          // Merge simples: mantém o que já existe, mas preenche campos vazios com o novo
           const prev = tplMap.get(k);
+
+          // "último ganha" nas regras (pra não dar mensal virar diário)
           tplMap.set(k, {
             ...prev,
-            task_type: prev.task_type ?? t.task_type,
-            notes: prev.notes ?? t.notes,
-            priority: prev.priority ?? t.priority,
-            frequency: prev.frequency ?? t.frequency,
-            classification: prev.classification ?? t.classification,
-            assignee_name: prev.assignee_name ?? t.assignee_name,
-            assignee_email: prev.assignee_email ?? t.assignee_email,
+            ...t,
+            // mas mantém o que não veio preenchido
+            task_type: t.task_type ?? prev.task_type,
+            notes: t.notes ?? prev.notes,
+            priority: t.priority ?? prev.priority,
+            frequency: t.frequency ?? prev.frequency,
+            classification: t.classification ?? prev.classification,
+            assignee_name: t.assignee_name ?? prev.assignee_name,
+            assignee_email: t.assignee_email ?? prev.assignee_email,
           });
         } else {
           tplMap.set(k, t);
@@ -209,20 +307,16 @@ export default function ImportPage() {
       const templatesPayload = Array.from(tplMap.values());
       append(`Templates deduplicados: ${templatesPayload.length} (removidos: ${tplDup})`);
 
-      // 3) Upsert templates em lotes
+      // 3) Upsert templates
       const chunkSize = 200;
       for (let i = 0; i < templatesPayload.length; i += chunkSize) {
         const chunk = templatesPayload.slice(i, i + chunkSize);
-
         const { error } = await supabase
           .from("task_templates")
           .upsert(chunk, { onConflict: "user_id,planner,sector,title" });
 
         if (error) throw new Error(error.message);
-
-        append(
-          `Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`
-        );
+        append(`Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`);
       }
 
       append("Buscando IDs dos templates pra mapear runs...");
@@ -238,7 +332,7 @@ export default function ImportPage() {
         map.set(tplKey(t.planner, t.sector, t.title), t.id);
       });
 
-      // 4) Runs/histórico
+      // 4) Runs/histórico (se tiver)
       let runsRows: Row[] = [];
       const sheetRuns = wb.SheetNames.find((n) => ["Runs", "Execucoes", "Execuções"].includes(n)) || "";
 
@@ -268,8 +362,7 @@ export default function ImportPage() {
           if (!due_date) return null;
 
           const statusRaw = norm(r["Status"] || "");
-          const status =
-            done_date || statusRaw.toLowerCase().includes("concl") ? "done" : "open";
+          const status = done_date || statusRaw.toLowerCase().includes("concl") ? "done" : "open";
 
           return {
             user_id: u.id,
@@ -285,7 +378,7 @@ export default function ImportPage() {
 
       append(`Runs detectadas (bruto, com due_date): ${runsRaw.length}`);
 
-      // 5) DEDUPLICAR runs (template_id + due_date)
+      // Dedup runs
       const runMap = new Map<string, any>();
       let runDup = 0;
 
@@ -293,11 +386,9 @@ export default function ImportPage() {
         const k = runKey(r.template_id, r.due_date);
         if (runMap.has(k)) {
           runDup++;
-
-          // merge: se alguma linha tiver done_at/status done, prioriza isso
           const prev = runMap.get(k);
           const betterDoneAt = prev.done_at ?? r.done_at;
-          const betterStatus = (prev.status === "done" || r.status === "done") ? "done" : "open";
+          const betterStatus = prev.status === "done" || r.status === "done" ? "done" : "open";
 
           runMap.set(k, {
             ...prev,
@@ -322,7 +413,6 @@ export default function ImportPage() {
             .upsert(chunk, { onConflict: "template_id,due_date" });
 
           if (error) throw new Error(error.message);
-
           append(`Upsert runs: ${Math.min(i + chunkSize, runsPayload.length)}/${runsPayload.length}`);
         }
       } else {
@@ -331,7 +421,6 @@ export default function ImportPage() {
 
       append("✅ Importação concluída!");
       append("Agora vai em /runs e clica Generate runs (30d) pra criar vencimentos automáticos.");
-
     } catch (e: any) {
       append("❌ ERRO: " + (e?.message || String(e)));
     } finally {
@@ -348,11 +437,7 @@ export default function ImportPage() {
           </CardHeader>
 
           <CardContent className="space-y-3">
-            <Input
-              type="file"
-              accept=".xlsx,.xls"
-              onChange={(e) => setFile(e.target.files?.[0] || null)}
-            />
+            <Input type="file" accept=".xlsx,.xls" onChange={(e) => setFile(e.target.files?.[0] || null)} />
 
             <div className="flex gap-2">
               <Button onClick={runImport} disabled={!file || busy}>
@@ -369,7 +454,7 @@ export default function ImportPage() {
             </pre>
 
             <div className="text-xs opacity-70">
-              Dica: se seu Excel tiver “Data Fim”, ele importa histórico (runs). Se não tiver, ele importa só templates.
+              Import respeita sua coluna <b>Frequencia</b> e o <b>Dia Util</b> (Nº do dia útil do mês). Sem Data Fim = sem histórico.
             </div>
           </CardContent>
         </Card>
