@@ -22,18 +22,21 @@ import {
   Cell,
 } from "recharts";
 
+type TemplateMini = {
+  task_id: string | null;
+  title: string;
+  sector: string | null;
+  frequency: string | null;
+};
+
+// SUPABASE às vezes devolve objeto, às vezes array. A gente aceita os dois.
 type Run = {
   id: string;
   template_id: string;
   due_date: string | null;
   done_at: string | null;
-  status: string;
-  task_templates?: {
-    task_id: string | null;
-    title: string;
-    sector: string | null;
-    frequency: string | null;
-  } | null;
+  status: string | null;
+  task_template?: TemplateMini | TemplateMini[] | null; // <- aqui tá o pulo do gato
 };
 
 function todayISO() {
@@ -43,6 +46,7 @@ function todayISO() {
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 }
+
 function addDays(iso: string, days: number) {
   const d = new Date(iso + "T00:00:00");
   d.setDate(d.getDate() + days);
@@ -51,11 +55,23 @@ function addDays(iso: string, days: number) {
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 }
+
 function isoToDateEnd(iso: string) {
   return new Date(iso + "T23:59:59");
 }
 function isoToDateStart(iso: string) {
   return new Date(iso + "T00:00:00");
+}
+
+function isDone(r: Run) {
+  return r.status === "done" || !!r.done_at;
+}
+
+// normaliza: se vier array, pega o primeiro; se vier objeto, usa ele; se vier null, null
+function getTpl(r: Run): TemplateMini | null {
+  const t = r.task_template;
+  if (!t) return null;
+  return Array.isArray(t) ? (t[0] ?? null) : t;
 }
 
 export default function DashboardPage() {
@@ -65,7 +81,6 @@ export default function DashboardPage() {
   const [errorMsg, setErrorMsg] = useState("");
   const [runs, setRuns] = useState<Run[]>([]);
 
-  // range default: last 30 days (by due_date)
   const [daysBack, setDaysBack] = useState(30);
 
   async function load() {
@@ -81,15 +96,20 @@ export default function DashboardPage() {
     const end = todayISO();
     const start = addDays(end, -daysBack);
 
+    // ✅ usa alias task_template pra ficar claro
     const { data, error } = await supabase
       .from("task_runs")
-      .select("id,template_id,due_date,done_at,status, task_templates(task_id,title,sector,frequency)")
+      .select(
+        "id,template_id,due_date,done_at,status, task_template:task_templates(task_id,title,sector,frequency)"
+      )
       .gte("due_date", start)
       .lte("due_date", end)
       .order("due_date", { ascending: true });
 
     if (error) setErrorMsg(error.message);
-    setRuns((data || []) as Run[]);
+
+    // ✅ cast seguro (porque supabase retorna any)
+    setRuns((data || []) as unknown as Run[]);
     setLoading(false);
   }
 
@@ -100,10 +120,10 @@ export default function DashboardPage() {
 
   const kpis = useMemo(() => {
     const now = isoToDateStart(todayISO());
-    const total = runs.length;
-    const done = runs.filter((r) => r.status === "done" || !!r.done_at);
-    const open = runs.filter((r) => !(r.status === "done" || !!r.done_at));
 
+    const total = runs.length;
+    const done = runs.filter((r) => isDone(r));
+    const open = runs.filter((r) => !isDone(r));
     const overdue = open.filter((r) => r.due_date && isoToDateEnd(r.due_date) < now);
 
     const onTime = done.filter((r) => {
@@ -122,6 +142,7 @@ export default function DashboardPage() {
           return lateDays;
         })
         .filter((n) => n > 0);
+
       if (!lates.length) return 0;
       return Math.round((lates.reduce((a, b) => a + b, 0) / lates.length) * 10) / 10;
     })();
@@ -141,15 +162,17 @@ export default function DashboardPage() {
     const now = isoToDateStart(todayISO());
 
     for (const r of runs) {
-      const sector = r.task_templates?.sector || "—";
+      const tpl = getTpl(r);
+      const sector = tpl?.sector || "—";
+
       if (!map.has(sector)) map.set(sector, { sector, total: 0, done: 0, overdue: 0 });
       const row = map.get(sector)!;
 
       row.total += 1;
-      const isDone = r.status === "done" || !!r.done_at;
-      if (isDone) row.done += 1;
 
-      const isOpen = !isDone;
+      if (isDone(r)) row.done += 1;
+
+      const isOpen = !isDone(r);
       if (isOpen && r.due_date && isoToDateEnd(r.due_date) < now) row.overdue += 1;
     }
 
@@ -157,20 +180,17 @@ export default function DashboardPage() {
   }, [runs]);
 
   const dailyDoneTrend = useMemo(() => {
-    // trend by done_at day (fallback due_date)
     const map = new Map<string, number>();
+
     for (const r of runs) {
-      const isDone = r.status === "done" || !!r.done_at;
-      if (!isDone) continue;
+      if (!isDone(r)) continue;
 
-      const day =
-        r.done_at?.slice(0, 10) ||
-        r.due_date ||
-        null;
-
+      const day = r.done_at?.slice(0, 10) || r.due_date || null;
       if (!day) continue;
+
       map.set(day, (map.get(day) || 0) + 1);
     }
+
     return Array.from(map.entries())
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([day, count]) => ({ day, count }));
@@ -184,7 +204,6 @@ export default function DashboardPage() {
     ];
   }, [kpis]);
 
-  // recharts pede Cell color, mas a gente não vai “viajar” em paleta aqui
   const pieColors = ["#16a34a", "#2563eb", "#dc2626"];
 
   return (
@@ -195,6 +214,7 @@ export default function DashboardPage() {
             <h1 className="text-xl font-semibold">Dashboard</h1>
             <div className="text-xs opacity-70">KPIs por vencimento (due_date) — últimos {daysBack} dias</div>
           </div>
+
           <div className="flex gap-2">
             <Button variant={daysBack === 7 ? "default" : "outline"} onClick={() => setDaysBack(7)}>
               7d
@@ -282,9 +302,7 @@ export default function DashboardPage() {
                   <Line type="monotone" dataKey="count" strokeWidth={2} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
-              <div className="text-xs opacity-70 mt-2">
-                (Conta conclusões por dia — usando done_at)
-              </div>
+              <div className="text-xs opacity-70 mt-2">(Conta conclusões por dia — usando done_at)</div>
             </CardContent>
           </Card>
 
@@ -303,9 +321,7 @@ export default function DashboardPage() {
                   <Bar dataKey="overdue" />
                 </BarChart>
               </ResponsiveContainer>
-              <div className="text-xs opacity-70 mt-2">
-                Total vs Done vs Overdue por setor.
-              </div>
+              <div className="text-xs opacity-70 mt-2">Total vs Done vs Overdue por setor.</div>
             </CardContent>
           </Card>
         </div>
