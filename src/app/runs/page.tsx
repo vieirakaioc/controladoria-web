@@ -7,6 +7,7 @@ import { supabase } from "@/lib/supabaseClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -15,6 +16,24 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+
+type Template = {
+  id: string;
+  task_id: string | null;
+  title: string;
+  sector: string | null;
+  task_type: string | null;
+  frequency: string | null;
+  priority: number | null;
+  workday_only: boolean;
+
+  schedule_kind: string | null; // daily | weekly | biweekly | monthly | once
+  schedule_every: number | null;
+  due_day: number | null; // monthly: N do dia útil (quando workday_only=true) OU dia do mês (quando workday_only=false)
+  due_weekday: number | null; // 1..7 (Mon..Sun)
+  anchor_date: string | null; // YYYY-MM-DD
+  active: boolean;
+};
 
 type Run = {
   id: string;
@@ -26,119 +45,133 @@ type Run = {
   status: string;
   notes: string | null;
   created_at: string;
-  task_templates?: {
-    task_id: string | null;
-    title: string;
-    sector: string | null;
-    task_type: string | null;
-    frequency: string | null;
-    priority: number | null;
-    workday_only: boolean;
-    active: boolean;
-
-    schedule_kind?: string | null;
-    due_day?: number | null;
-    due_weekday?: number | null;
-    schedule_every?: number | null;
-    anchor_date?: string | null;
-  } | null;
+  task_templates?: Template | null;
 };
 
+function isoToDate(iso: string) {
+  // sempre UTC pra não dar treta
+  return new Date(`${iso}T00:00:00Z`);
+}
+function dateToISO(d: Date) {
+  return d.toISOString().slice(0, 10);
+}
 function todayISO() {
-  const d = new Date();
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+  return dateToISO(new Date());
 }
-
-function addDays(iso: string, days: number) {
-  const d = new Date(iso + "T00:00:00");
-  d.setDate(d.getDate() + days);
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  const dd = String(d.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd}`;
+function addDaysISO(iso: string, days: number) {
+  const d = isoToDate(iso);
+  d.setUTCDate(d.getUTCDate() + days);
+  return dateToISO(d);
 }
-
 function weekday1to7(iso: string) {
-  const d = new Date(iso + "T00:00:00");
-  const js = d.getDay(); // 0=Sun..6=Sat
+  const d = isoToDate(iso);
+  const js = d.getUTCDay(); // 0=Sun..6=Sat
   return js === 0 ? 7 : js; // 1=Mon..7=Sun
 }
-
-function daysInMonth(year: number, month1to12: number) {
-  return new Date(year, month1to12, 0).getDate();
+function isWorkday(iso: string) {
+  const wd = weekday1to7(iso);
+  return wd >= 1 && wd <= 5;
 }
-
-function nthWorkdayOfMonth(year: number, month1to12: number, n: number) {
-  // retorna YYYY-MM-DD do n-ésimo dia útil (Mon-Fri) do mês
+function daysBetween(aISO: string, bISO: string) {
+  const a = isoToDate(aISO).getTime();
+  const b = isoToDate(bISO).getTime();
+  return Math.floor((b - a) / 86400000);
+}
+function startOfWeekMondayISO(iso: string) {
+  const wd = weekday1to7(iso); // 1..7
+  return addDaysISO(iso, -(wd - 1));
+}
+function weeksBetween(aISO: string, bISO: string) {
+  const a = startOfWeekMondayISO(aISO);
+  const b = startOfWeekMondayISO(bISO);
+  return Math.floor(daysBetween(a, b) / 7);
+}
+function daysInMonthUTC(year: number, month1to12: number) {
+  // month1to12: 1..12
+  return new Date(Date.UTC(year, month1to12, 0)).getUTCDate();
+}
+function nthWorkdayOfMonthISO(year: number, month1to12: number, n: number) {
   let count = 0;
-  for (let day = 1; day <= daysInMonth(year, month1to12); day++) {
+  const dim = daysInMonthUTC(year, month1to12);
+  for (let day = 1; day <= dim; day++) {
     const iso = `${year}-${String(month1to12).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-    const wd = weekday1to7(iso);
-    if (wd >= 1 && wd <= 5) {
+    if (isWorkday(iso)) {
       count++;
       if (count === n) return iso;
     }
   }
   return null;
 }
+function occurrenceOfWeekdayInMonth(iso: string, targetWeekday: number) {
+  // iso é o dia candidato; conta quantas vezes aquele weekday apareceu no mês até aquele dia
+  const d = isoToDate(iso);
+  const year = d.getUTCFullYear();
+  const month = d.getUTCMonth() + 1;
 
-function diffDays(a: string, b: string) {
-  const da = new Date(a + "T00:00:00").getTime();
-  const db = new Date(b + "T00:00:00").getTime();
-  return Math.floor((db - da) / (1000 * 60 * 60 * 24));
+  const day = d.getUTCDate();
+  let count = 0;
+  for (let i = 1; i <= day; i++) {
+    const cur = `${year}-${String(month).padStart(2, "0")}-${String(i).padStart(2, "0")}`;
+    if (weekday1to7(cur) === targetWeekday) count++;
+  }
+  return count; // 1,2,3...
+}
+function monthsBetween(aISO: string, bISO: string) {
+  const a = isoToDate(aISO);
+  const b = isoToDate(bISO);
+  return (b.getUTCFullYear() - a.getUTCFullYear()) * 12 + (b.getUTCMonth() - a.getUTCMonth());
 }
 
-function monthDiff(a: string, b: string) {
-  const da = new Date(a + "T00:00:00");
-  const db = new Date(b + "T00:00:00");
-  return (db.getFullYear() - da.getFullYear()) * 12 + (db.getMonth() - da.getMonth());
-}
+function dueDateForMonthly(t: Template, year: number, month1to12: number) {
+  const dueDay = t.due_day ?? 5;
 
-function weekIndexFrom(iso: string) {
-  // semana baseada em segunda-feira
-  const d = new Date(iso + "T00:00:00");
-  const day = d.getDay(); // 0..6
-  const deltaToMon = day === 0 ? -6 : 1 - day;
-  d.setDate(d.getDate() + deltaToMon);
-  return Math.floor(d.getTime() / (1000 * 60 * 60 * 24 * 7));
+  if (t.workday_only) {
+    return nthWorkdayOfMonthISO(year, month1to12, dueDay);
+  }
+
+  const dim = daysInMonthUTC(year, month1to12);
+  if (dueDay < 1 || dueDay > dim) return null;
+  return `${year}-${String(month1to12).padStart(2, "0")}-${String(dueDay).padStart(2, "0")}`;
 }
 
 export default function RunsPage() {
   const router = useRouter();
 
   const [loading, setLoading] = useState(true);
-  const [errorMsg, setErrorMsg] = useState<string>("");
+  const [errorMsg, setErrorMsg] = useState("");
   const [runs, setRuns] = useState<Run[]>([]);
+  const [rangeDays, setRangeDays] = useState<number>(30);
+  const [busyGen, setBusyGen] = useState(false);
+  const [busyClear, setBusyClear] = useState(false);
+
+  async function requireUser() {
+    const { data: sessData, error } = await supabase.auth.getSession();
+    if (error) throw new Error(error.message);
+    const u = sessData.session?.user;
+    if (!u) {
+      router.replace("/login");
+      return null;
+    }
+    return u;
+  }
 
   async function loadRuns() {
     setErrorMsg("");
     setLoading(true);
 
-    const { data: sessData, error: sessErr } = await supabase.auth.getSession();
-    if (sessErr) {
-      setErrorMsg(sessErr.message);
-      setLoading(false);
-      return;
-    }
-
-    const u = sessData.session?.user;
-    if (!u) {
-      router.replace("/login");
-      return;
-    }
+    const u = await requireUser();
+    if (!u) return;
 
     const { data, error } = await supabase
       .from("task_runs")
       .select(
-        "*, task_templates(task_id,title,sector,task_type,frequency,priority,workday_only,active,schedule_kind,due_day,due_weekday,schedule_every,anchor_date)"
+        "id,user_id,template_id,due_date,start_date,done_at,status,notes,created_at,task_templates(id,task_id,title,sector,task_type,frequency,priority,workday_only,schedule_kind,schedule_every,due_day,due_weekday,anchor_date,active)"
       )
+      .eq("user_id", u.id)
       .order("due_date", { ascending: true });
 
     if (error) setErrorMsg(error.message);
-    setRuns((data || []) as Run[]);
+    setRuns((data || []) as any);
     setLoading(false);
   }
 
@@ -147,157 +180,192 @@ export default function RunsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function generateRuns30d() {
+  async function toggleDone(r: Run) {
     setErrorMsg("");
+    const u = await requireUser();
+    if (!u) return;
 
-    const { data: sessData, error: sessErr } = await supabase.auth.getSession();
-    if (sessErr) return setErrorMsg(sessErr.message);
+    const isDone = r.status === "done";
+    const nextStatus = isDone ? "open" : "done";
+    const nextDoneAt = isDone ? null : new Date().toISOString();
 
-    const u = sessData.session?.user;
-    if (!u) return router.replace("/login");
-    const uid = u.id;
-
-    const { data: templates, error: tErr } = await supabase
-      .from("task_templates")
-      .select("id,user_id,active,workday_only,schedule_kind,due_day,due_weekday,schedule_every,anchor_date")
-      .eq("active", true);
-
-    if (tErr) return setErrorMsg(tErr.message);
-
-    const start = todayISO();
-    const days = 30;
-    const end = addDays(start, days);
-
-    const { data: existing, error: eErr } = await supabase
+    const { error } = await supabase
       .from("task_runs")
-      .select("template_id, due_date")
-      .gte("due_date", start)
-      .lte("due_date", end);
+      .update({ status: nextStatus, done_at: nextDoneAt })
+      .eq("id", r.id)
+      .eq("user_id", u.id);
 
-    if (eErr) return setErrorMsg(eErr.message);
-
-    const existingSet = new Set<string>(
-      (existing || []).map((r: any) => `${r.template_id}|${r.due_date}`)
-    );
-
-    const inserts: any[] = [];
-
-    for (const t of (templates || []) as any[]) {
-      if (t.user_id !== uid) continue;
-
-      const kind = (t.schedule_kind || "monthly") as string;
-      const dueDay = typeof t.due_day === "number" ? t.due_day : null;
-      const dueWk = typeof t.due_weekday === "number" ? t.due_weekday : null;
-
-      const every =
-        typeof t.schedule_every === "number" && t.schedule_every > 0 ? t.schedule_every : 1;
-
-      const anchor = (t.anchor_date as string) || start;
-
-      for (let i = 0; i <= days; i++) {
-        const d = addDays(start, i);
-        let shouldCreate = false;
-
-        if (kind === "daily") {
-          const cal = diffDays(anchor, d);
-          if (cal < 0) {
-            shouldCreate = false;
-          } else if (t.workday_only) {
-            // só seg-sex (e respeita schedule_every em DIAS ÚTEIS)
-            const wd = weekday1to7(d); // 1=Mon..7=Sun
-            if (wd >= 1 && wd <= 5) {
-              // business day offset: conta só dias úteis a partir do anchor
-              let count = 0;
-              for (let x = anchor; ; x = addDays(x, 1)) {
-                const wdx = weekday1to7(x);
-                if (wdx >= 1 && wdx <= 5) count++;
-                if (x === d) break;
-              }
-              const bizOffset = count - 1; // 0 no primeiro dia útil
-              shouldCreate = bizOffset % every === 0;
-            } else {
-              shouldCreate = false;
-            }
-          } else {
-            // daily incluindo fim de semana
-            shouldCreate = cal % every === 0;
-          }
-
-        } else if (kind === "weekly") {
-          if (dueWk && weekday1to7(d) === dueWk) {
-            const wa = weekIndexFrom(anchor);
-            const wd = weekIndexFrom(d);
-            const diff = wd - wa;
-            shouldCreate = diff >= 0 && diff % every === 0;
-          }
-
-        } else if (kind === "monthly") {
-          const md = monthDiff(anchor, d);
-          if (md >= 0 && md % every === 0 && dueDay) {
-            const dt = new Date(d + "T00:00:00");
-            const year = dt.getFullYear();
-            const month = dt.getMonth() + 1;
-
-            if (t.workday_only) {
-              const nth = nthWorkdayOfMonth(year, month, dueDay);
-              shouldCreate = nth === d;
-            } else {
-              const dim = daysInMonth(year, month);
-              if (dueDay <= dim) {
-                const isoDue = `${year}-${String(month).padStart(2, "0")}-${String(dueDay).padStart(2, "0")}`;
-                shouldCreate = isoDue === d;
-              }
-            }
-          }
-
-        } else if (kind === "once") {
-          // não gera automaticamente a partir de "once"
-          shouldCreate = false;
-        }
-
-        if (!shouldCreate) continue;
-
-        const key = `${t.id}|${d}`;
-        if (existingSet.has(key)) continue;
-
-        inserts.push({
-          user_id: uid,
-          template_id: t.id,
-          due_date: d,
-          start_date: null,
-          done_at: null,
-          status: "open",
-          notes: null,
-        });
-      }
-    }
-
-    if (inserts.length === 0) {
-      setErrorMsg("No runs to generate (or all already exist).");
-      return;
-    }
-
-    const chunkSize = 200;
-    for (let i = 0; i < inserts.length; i += chunkSize) {
-      const chunk = inserts.slice(i, i + chunkSize);
-      const { error } = await supabase.from("task_runs").insert(chunk);
-      if (error) return setErrorMsg(error.message);
-    }
-
+    if (error) return setErrorMsg(error.message);
     await loadRuns();
   }
 
-  async function toggleDone(r: Run) {
+  async function clearRunsRange() {
     setErrorMsg("");
-    const isDone = r.status === "done";
-    const patch = isDone
-      ? { status: "open", done_at: null }
-      : { status: "done", done_at: new Date().toISOString() };
+    const u = await requireUser();
+    if (!u) return;
 
-    const { error } = await supabase.from("task_runs").update(patch).eq("id", r.id);
-    if (error) return setErrorMsg(error.message);
+    const start = todayISO();
+    const end = addDaysISO(start, rangeDays);
 
-    await loadRuns();
+    const ok = confirm(
+      `Vai apagar TODAS as runs do seu usuário no range:\n${start} até ${end}\n\nConfirma?`
+    );
+    if (!ok) return;
+
+    setBusyClear(true);
+    try {
+      const { error } = await supabase
+        .from("task_runs")
+        .delete()
+        .eq("user_id", u.id)
+        .gte("due_date", start)
+        .lte("due_date", end);
+
+      if (error) throw new Error(error.message);
+      await loadRuns();
+    } catch (e: any) {
+      setErrorMsg(e?.message || String(e));
+    } finally {
+      setBusyClear(false);
+    }
+  }
+
+  async function generateRuns() {
+    setErrorMsg("");
+    setBusyGen(true);
+
+    try {
+      const u = await requireUser();
+      if (!u) return;
+
+      const start = todayISO();
+      const end = addDaysISO(start, rangeDays);
+
+      // templates ativos do usuário
+      const { data: templates, error: tErr } = await supabase
+        .from("task_templates")
+        .select(
+          "id,user_id,task_id,title,sector,task_type,frequency,priority,workday_only,active,schedule_kind,schedule_every,due_day,due_weekday,anchor_date"
+        )
+        .eq("user_id", u.id)
+        .eq("active", true);
+
+      if (tErr) throw new Error(tErr.message);
+
+      // runs já existentes no range
+      const { data: existing, error: eErr } = await supabase
+        .from("task_runs")
+        .select("template_id,due_date")
+        .eq("user_id", u.id)
+        .gte("due_date", start)
+        .lte("due_date", end);
+
+      if (eErr) throw new Error(eErr.message);
+
+      const existingSet = new Set<string>(
+        (existing || []).map((r: any) => `${r.template_id}|${r.due_date}`)
+      );
+
+      const inserts: any[] = [];
+
+      for (const t of (templates || []) as any as Template[]) {
+        const kind = (t.schedule_kind || "monthly").toLowerCase();
+        const every = Math.max(1, t.schedule_every ?? 1);
+        const anchor = t.anchor_date || start;
+
+        for (let i = 0; i <= rangeDays; i++) {
+          const d = addDaysISO(start, i);
+
+          let shouldCreate = false;
+
+          // regras por kind
+          if (kind === "daily") {
+            if (t.workday_only && !isWorkday(d)) {
+              shouldCreate = false;
+            } else {
+              const diff = daysBetween(anchor, d);
+              shouldCreate = diff >= 0 && diff % every === 0;
+            }
+          } else if (kind === "weekly") {
+            const wd = t.due_weekday ?? 5; // default Friday
+            if (weekday1to7(d) !== wd) {
+              shouldCreate = false;
+            } else if (t.workday_only && wd > 5) {
+              shouldCreate = false;
+            } else {
+              const wdiff = weeksBetween(anchor, d);
+              shouldCreate = wdiff >= 0 && wdiff % every === 0;
+            }
+          } else if (kind === "biweekly") {
+            // 1ª e 3ª ocorrência do weekday no mês (ex: 1ª e 3ª sexta)
+            const wd = t.due_weekday ?? 5;
+            if (weekday1to7(d) !== wd) {
+              shouldCreate = false;
+            } else if (t.workday_only && wd > 5) {
+              shouldCreate = false;
+            } else {
+              // opcional: respeita "every" por mês (normalmente 1)
+              const mdiff = monthsBetween(anchor, d);
+              if (mdiff < 0 || mdiff % every !== 0) {
+                shouldCreate = false;
+              } else {
+                const occ = occurrenceOfWeekdayInMonth(d, wd);
+                shouldCreate = occ === 1 || occ === 3;
+              }
+            }
+          } else if (kind === "monthly") {
+            const mdiff = monthsBetween(anchor, d);
+            if (mdiff < 0 || mdiff % every !== 0) {
+              shouldCreate = false;
+            } else {
+              const dt = isoToDate(d);
+              const year = dt.getUTCFullYear();
+              const month = dt.getUTCMonth() + 1;
+
+              const due = dueDateForMonthly(t, year, month);
+              shouldCreate = due === d;
+            }
+          } else if (kind === "once") {
+            // pontual: usa anchor_date como a data
+            shouldCreate = d === anchor;
+          }
+
+          if (!shouldCreate) continue;
+
+          const key = `${t.id}|${d}`;
+          if (existingSet.has(key)) continue;
+
+          inserts.push({
+            user_id: u.id,
+            template_id: t.id,
+            due_date: d,
+            start_date: null,
+            done_at: null,
+            status: "open",
+            notes: null,
+          });
+        }
+      }
+
+      if (inserts.length === 0) {
+        setErrorMsg("Nada pra gerar (ou já existe tudo no range).");
+        return;
+      }
+
+      // insere em lotes
+      const chunkSize = 200;
+      for (let i = 0; i < inserts.length; i += chunkSize) {
+        const chunk = inserts.slice(i, i + chunkSize);
+        const { error } = await supabase.from("task_runs").insert(chunk);
+        if (error) throw new Error(error.message);
+      }
+
+      await loadRuns();
+    } catch (e: any) {
+      setErrorMsg(e?.message || String(e));
+    } finally {
+      setBusyGen(false);
+    }
   }
 
   const ordered = useMemo(() => runs, [runs]);
@@ -306,14 +374,33 @@ export default function RunsPage() {
     <main className="min-h-screen p-6">
       <div className="mx-auto max-w-6xl space-y-4">
         <Card>
-          <CardHeader className="flex flex-row items-center justify-between">
+          <CardHeader className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <div>
               <CardTitle>Runs (Vencimentos)</CardTitle>
               <div className="text-xs opacity-70">
-                Generate runs based on schedules (daily/weekly/monthly + workdays).
+                Geração respeita: daily/weekly/biweekly/monthly + workday_only + schedule_every.
               </div>
             </div>
-            <Button onClick={generateRuns30d}>Generate runs (30d)</Button>
+
+            <div className="flex flex-col gap-2 md:flex-row md:items-center">
+              <div className="flex items-center gap-2">
+                <div className="text-xs opacity-70">Range (days)</div>
+                <Input
+                  type="number"
+                  className="w-24"
+                  value={rangeDays}
+                  onChange={(e) => setRangeDays(Math.max(1, Math.min(365, Number(e.target.value || 30))))}
+                />
+              </div>
+
+              <Button onClick={generateRuns} disabled={busyGen}>
+                {busyGen ? "Generating..." : `Generate runs (${rangeDays}d)`}
+              </Button>
+
+              <Button variant="outline" onClick={clearRunsRange} disabled={busyClear}>
+                {busyClear ? "Clearing..." : `Clear runs (${rangeDays}d)`}
+              </Button>
+            </div>
           </CardHeader>
 
           <CardContent className="space-y-3">
@@ -339,6 +426,19 @@ export default function RunsPage() {
                   {ordered.map((r) => {
                     const t = r.task_templates;
                     const st = r.status === "done" ? "DONE" : "OPEN";
+
+                    const sch =
+                      t?.schedule_kind
+                        ? `${t.schedule_kind}${t.schedule_every && t.schedule_every > 1 ? `/${t.schedule_every}` : ""}`
+                        : "-";
+
+                    const dueRule =
+                      t?.schedule_kind === "monthly"
+                        ? `due_day=${t.due_day ?? "-"}${t.workday_only ? " (workday)" : ""}`
+                        : t?.schedule_kind === "weekly" || t?.schedule_kind === "biweekly"
+                        ? `weekday=${t.due_weekday ?? "-"}`
+                        : "";
+
                     return (
                       <TableRow key={r.id} className={st === "DONE" ? "opacity-70" : ""}>
                         <TableCell>
@@ -349,8 +449,8 @@ export default function RunsPage() {
                         <TableCell>{r.due_date || "-"}</TableCell>
                         <TableCell className="text-xs opacity-80">
                           <div>{t?.sector ? `Sector: ${t.sector}` : ""}</div>
-                          <div>{t?.task_type ? `Type: ${t.task_type}` : ""}</div>
                           <div>{t?.frequency ? `Frequency: ${t.frequency}` : ""}</div>
+                          <div>{`Sched: ${sch}${dueRule ? ` | ${dueRule}` : ""}`}</div>
                         </TableCell>
                         <TableCell className="text-right">
                           <Button size="sm" variant="outline" onClick={() => toggleDone(r)}>
@@ -364,7 +464,7 @@ export default function RunsPage() {
                   {!loading && ordered.length === 0 ? (
                     <TableRow>
                       <TableCell colSpan={6} className="text-center text-sm opacity-70 py-10">
-                        No runs yet. Click <b>Generate runs (30d)</b>.
+                        No runs yet. Click <b>Generate runs</b>.
                       </TableCell>
                     </TableRow>
                   ) : null}

@@ -11,8 +11,20 @@ import { Input } from "@/components/ui/input";
 
 type Row = Record<string, any>;
 
+function stripAccentsLower(v: any) {
+  return String(v ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
 function norm(v: any) {
-  return String(v ?? "").trim();
+  // trim + colapsa espaços
+  return String(v ?? "")
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function asInt(v: any): number | null {
@@ -20,6 +32,65 @@ function asInt(v: any): number | null {
   if (!s) return null;
   const n = parseInt(s, 10);
   return Number.isFinite(n) ? n : null;
+}
+
+function clampInt(v: number | null, min: number, max: number) {
+  if (v == null) return null;
+  if (!Number.isFinite(v)) return null;
+  if (v < min) return min;
+  if (v > max) return max;
+  return v;
+}
+
+// aceita: 1..7 ou "seg/segunda/mon", "ter/terça/tue", ..., "sex/sexta/fri", "sab/sábado/sat", "dom/sun"
+function parseWeekday(v: any): number | null {
+  if (v === null || v === undefined) return null;
+
+  const n = asInt(v);
+  if (n && n >= 1 && n <= 7) return n;
+
+  const s = stripAccentsLower(v);
+  if (!s) return null;
+
+  const map: Record<string, number> = {
+    seg: 1,
+    segunda: 1,
+    monday: 1,
+    mon: 1,
+
+    ter: 2,
+    terca: 2,
+    tuesday: 2,
+    tue: 2,
+
+    qua: 3,
+    quarta: 3,
+    wednesday: 3,
+    wed: 3,
+
+    qui: 4,
+    quinta: 4,
+    thursday: 4,
+    thu: 4,
+
+    sex: 5,
+    sexta: 5,
+    friday: 5,
+    fri: 5,
+
+    sab: 6,
+    sabado: 6,
+    saturday: 6,
+    sat: 6,
+
+    dom: 7,
+    domingo: 7,
+    sunday: 7,
+    sun: 7,
+  };
+
+  const first = s.split(/[\s\-_/]+/)[0];
+  return map[first] ?? null;
 }
 
 function toISODate(v: any): string | null {
@@ -68,50 +139,59 @@ function runKey(templateId: string, dueDate: string) {
 }
 
 /**
- * Mapeia a sua coluna "Frequencia" para regras.
- * diaUtilN = N do dia útil (ex: 5 = 5º dia útil)
- * diaSemana = 1..7 (1=Mon .. 7=Sun) (opcional)
+ * Mapeia a coluna "Frequencia" para regras.
+ *
+ * DIA ÚTIL (sua coluna):
+ * - mensal/bimestral/trimestral/anual -> Dia Util = N do dia útil do mês (ex: 5 = 5º dia útil)
+ * - semanal/quinzenal -> se NÃO tiver Dia Semana, usa Dia Util como weekday (1..7)
+ *
+ * Quinzenal vira schedule_kind="biweekly" (pra regra 1ª e 3ª ocorrência do weekday no mês no /runs).
  */
 function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: number | null) {
-  const f = (freqRaw || "").toLowerCase();
+  const f = stripAccentsLower(freqRaw);
 
   // defaults corporativos
-  const defaultWorkdayN = diaUtilN ?? 5; // se você não preencher, assume 5º dia útil
-  const defaultWeekday = diaSemana ?? 5; // se não preencher, assume sexta
+  const defaultWorkdayN = clampInt(diaUtilN, 1, 31) ?? 5;
 
-  // diária (por padrão a gente considera "dia útil" como Mon-Fri)
-  if (f.includes("diár") || f.includes("diar")) {
+  // weekday: prioridade é Dia Semana; se não tiver, tenta Dia Util (1..7); senão Friday (5)
+  const inferredWeekdayFromDiaUtil = clampInt(diaUtilN, 1, 7);
+  const defaultWeekday = clampInt(diaSemana, 1, 7) ?? inferredWeekdayFromDiaUtil ?? 5;
+
+  // diária (Mon-Fri)
+  if (f.includes("diaria")) {
     return {
       schedule_kind: "daily",
       schedule_every: 1,
       due_weekday: null,
       due_day: null,
-      workday_only: true, // diária = só dias úteis (Mon-Fri)
+      workday_only: true,
     };
   }
 
-  // semanal / quinzenal
-  if (f.includes("quinz")) {
+  // quinzenal (1ª e 3ª ocorrência do weekday no mês - tratado no /runs)
+  if (f.includes("quinzenal")) {
     return {
-      schedule_kind: "weekly",
-      schedule_every: 2,
+      schedule_kind: "biweekly",
+      schedule_every: 1,
       due_weekday: defaultWeekday,
       due_day: null,
-      workday_only: false,
+      workday_only: true,
     };
   }
-  if (f.includes("seman")) {
+
+  // semanal
+  if (f.includes("semanal")) {
     return {
       schedule_kind: "weekly",
       schedule_every: 1,
       due_weekday: defaultWeekday,
       due_day: null,
-      workday_only: false,
+      workday_only: true,
     };
   }
 
-  // mensal / bimestral / trimestral / anual (sempre por dia útil N)
-  if (f.includes("bimes")) {
+  // mensal / bimestral / trimestral / anual (por dia útil N)
+  if (f.includes("bimestral")) {
     return {
       schedule_kind: "monthly",
       schedule_every: 2,
@@ -120,7 +200,7 @@ function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: num
       workday_only: true,
     };
   }
-  if (f.includes("trim")) {
+  if (f.includes("trimestral")) {
     return {
       schedule_kind: "monthly",
       schedule_every: 3,
@@ -138,7 +218,7 @@ function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: num
       workday_only: true,
     };
   }
-  if (f.includes("mens")) {
+  if (f.includes("mensal")) {
     return {
       schedule_kind: "monthly",
       schedule_every: 1,
@@ -149,7 +229,7 @@ function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: num
   }
 
   // pontual
-  if (f.includes("pont")) {
+  if (f.includes("pontual")) {
     return {
       schedule_kind: "once",
       schedule_every: 1,
@@ -204,8 +284,8 @@ export default function ImportPage() {
         wb.SheetNames.includes("Lista")
           ? "Lista"
           : wb.SheetNames.includes("Templates")
-            ? "Templates"
-            : wb.SheetNames[0];
+          ? "Templates"
+          : wb.SheetNames[0];
 
       const wsT = wb.Sheets[sheetTemplates];
       const rowsT = XLSX.utils.sheet_to_json<Row>(wsT, { defval: "" });
@@ -229,18 +309,19 @@ export default function ImportPage() {
           const assignee_name = norm(r["Responsável"] || "");
           const assignee_email = norm(r["e-mail"] || r["e-mail responsavel"] || r["email"] || "");
 
-          // LÊ O DIA ÚTIL N (sua regra)
+          // SUA COLUNA: Dia Útil
           const diaUtilN =
             asInt(r["Dia Util"]) ??
             asInt(r["Dia Útil"]) ??
             asInt(r["Dia_Util_N"]) ??
             null;
 
-          // opcional: dia da semana pra semanal (se você criar a coluna)
+          // DIA DA SEMANA (opcional): número 1..7 OU texto "sexta", "seg" etc.
+          // Se não tiver, semanal/quinzenal tentam usar Dia Util (1..7); senão Friday (5).
           const diaSemana =
-            asInt(r["Dia Semana"]) ??
-            asInt(r["Dia_Semana"]) ??
-            asInt(r["due_weekday"]) ??
+            parseWeekday(r["Dia Semana"]) ??
+            parseWeekday(r["Dia_Semana"]) ??
+            parseWeekday(r["due_weekday"]) ??
             null;
 
           const sch = freqToSchedule(frequency, diaUtilN, diaSemana);
@@ -286,7 +367,7 @@ export default function ImportPage() {
           tplDup++;
           const prev = tplMap.get(k);
 
-          // "último ganha" nas regras (pra não dar mensal virar diário)
+          // "último ganha" nas regras
           tplMap.set(k, {
             ...prev,
             ...t,
@@ -316,7 +397,9 @@ export default function ImportPage() {
           .upsert(chunk, { onConflict: "user_id,planner,sector,title" });
 
         if (error) throw new Error(error.message);
-        append(`Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`);
+        append(
+          `Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`
+        );
       }
 
       append("Buscando IDs dos templates pra mapear runs...");
@@ -421,6 +504,7 @@ export default function ImportPage() {
 
       append("✅ Importação concluída!");
       append("Agora vai em /runs e clica Generate runs (30d) pra criar vencimentos automáticos.");
+      append("Obs: Sem 'Dia Semana': Semanal/Quinzenal usam 'Dia Util' (1..7) como weekday; se não der, cai em Friday (5).");
     } catch (e: any) {
       append("❌ ERRO: " + (e?.message || String(e)));
     } finally {
@@ -454,7 +538,9 @@ export default function ImportPage() {
             </pre>
 
             <div className="text-xs opacity-70">
-              Import respeita sua coluna <b>Frequencia</b> e o <b>Dia Util</b> (Nº do dia útil do mês). Sem Data Fim = sem histórico.
+              Regras:
+              <br />- <b>Mensal/Bimestral/Trimestral/Anual</b>: <b>Dia Util</b> = Nº do dia útil do mês (ex: 5 = 5º).
+              <br />- <b>Semanal/Quinzenal</b>: se não tiver <b>Dia Semana</b>, usa <b>Dia Util</b> como weekday (1=Mon..7=Sun).
             </div>
           </CardContent>
         </Card>
