@@ -72,6 +72,7 @@ function daysInMonth(year: number, month1to12: number) {
 }
 
 function nthWorkdayOfMonth(year: number, month1to12: number, n: number) {
+  // retorna YYYY-MM-DD do n-ésimo dia útil (Mon-Fri) do mês
   let count = 0;
   for (let day = 1; day <= daysInMonth(year, month1to12); day++) {
     const iso = `${year}-${String(month1to12).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
@@ -195,12 +196,32 @@ export default function RunsPage() {
 
       for (let i = 0; i <= days; i++) {
         const d = addDays(start, i);
-
         let shouldCreate = false;
 
         if (kind === "daily") {
-          const dd = diffDays(anchor, d);
-          shouldCreate = dd >= 0 && dd % every === 0;
+          const cal = diffDays(anchor, d);
+          if (cal < 0) {
+            shouldCreate = false;
+          } else if (t.workday_only) {
+            // só seg-sex (e respeita schedule_every em DIAS ÚTEIS)
+            const wd = weekday1to7(d); // 1=Mon..7=Sun
+            if (wd >= 1 && wd <= 5) {
+              // business day offset: conta só dias úteis a partir do anchor
+              let count = 0;
+              for (let x = anchor; ; x = addDays(x, 1)) {
+                const wdx = weekday1to7(x);
+                if (wdx >= 1 && wdx <= 5) count++;
+                if (x === d) break;
+              }
+              const bizOffset = count - 1; // 0 no primeiro dia útil
+              shouldCreate = bizOffset % every === 0;
+            } else {
+              shouldCreate = false;
+            }
+          } else {
+            // daily incluindo fim de semana
+            shouldCreate = cal % every === 0;
+          }
 
         } else if (kind === "weekly") {
           if (dueWk && weekday1to7(d) === dueWk) {
@@ -230,17 +251,8 @@ export default function RunsPage() {
           }
 
         } else if (kind === "once") {
-          // se vier histórico do Excel, ele entra por upsert (import). Aqui é só “geração automática”.
-          if (dueDay) {
-            const dt = new Date(d + "T00:00:00");
-            const year = dt.getFullYear();
-            const month = dt.getMonth() + 1;
-            const dim = daysInMonth(year, month);
-            if (dueDay <= dim) {
-              const isoOnce = `${year}-${String(month).padStart(2, "0")}-${String(dueDay).padStart(2, "0")}`;
-              shouldCreate = isoOnce === d;
-            }
-          }
+          // não gera automaticamente a partir de "once"
+          shouldCreate = false;
         }
 
         if (!shouldCreate) continue;
@@ -298,7 +310,7 @@ export default function RunsPage() {
             <div>
               <CardTitle>Runs (Vencimentos)</CardTitle>
               <div className="text-xs opacity-70">
-                Generate runs based on schedules (daily/weekly/monthly/once + intervals).
+                Generate runs based on schedules (daily/weekly/monthly + workdays).
               </div>
             </div>
             <Button onClick={generateRuns30d}>Generate runs (30d)</Button>
