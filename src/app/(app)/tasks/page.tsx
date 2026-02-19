@@ -1,433 +1,767 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Badge } from "@/components/ui/badge";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 
-type TaskStatus = "open" | "done";
-
-type Task = {
+type Template = {
   id: string;
-  user_id: string;
+  task_id: string | null;
   title: string;
-  notes: string | null;
-  priority: number | null;
-  status: TaskStatus | string; // tolera valores
-  due_date: string | null; // YYYY-MM-DD
   sector: string | null;
-  task_type: string | null;
   frequency: string | null;
-  workday_only: boolean;
-  done_at: string | null; // timestamptz
-  created_at: string;
+  assignee_name: string | null;
+  assignee_email: string | null;
+  classification: string | null;
+  priority: number | null;
 };
 
-const PRIORITY_LABEL: Record<number, string> = {
-  0: "Urgent",
-  1: "Important",
-  2: "Medium",
-  3: "Low",
+type RunRow = {
+  id: string;
+  template_id: string;
+  due_date: string; // YYYY-MM-DD
+  done_at: string | null;
+  status: "open" | "done";
+  template: Template | Template[] | null; // pode vir como array dependendo do join
 };
 
-function fmtDate(yyyy_mm_dd: string | null) {
-  if (!yyyy_mm_dd) return "";
-  return yyyy_mm_dd;
+type Run = {
+  id: string;
+  template_id: string;
+  due_date: string;
+  done_at: string | null;
+  status: "open" | "done";
+  template: Template | null;
+};
+
+type KpiRow = {
+  id: string;
+  due_date: string;
+  status: "open" | "done";
+};
+
+function cx(...classes: Array<string | false | null | undefined>) {
+  return classes.filter(Boolean).join(" ");
+}
+
+function localISO(d: Date) {
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function addDaysISO(iso: string, days: number) {
+  const [y, m, d] = iso.split("-").map((x) => parseInt(x, 10));
+  const dt = new Date(y, (m || 1) - 1, d || 1);
+  dt.setDate(dt.getDate() + days);
+  return localISO(dt);
+}
+
+function startOfMonthISO(iso: string) {
+  const [y, m] = iso.split("-").map((x) => parseInt(x, 10));
+  const dt = new Date(y, (m || 1) - 1, 1);
+  return localISO(dt);
+}
+
+function endOfMonthISO(iso: string) {
+  const [y, m] = iso.split("-").map((x) => parseInt(x, 10));
+  const dt = new Date(y, (m || 1), 0); // dia 0 do próximo mês = último dia do mês atual
+  return localISO(dt);
+}
+
+function badgeClass(kind: "open" | "done" | "overdue" | "chip") {
+  if (kind === "done") return "bg-emerald-100 text-emerald-800 border-emerald-200";
+  if (kind === "overdue") return "bg-rose-100 text-rose-800 border-rose-200";
+  if (kind === "open") return "bg-amber-100 text-amber-800 border-amber-200";
+  return "bg-muted text-foreground border-border";
 }
 
 export default function TasksPage() {
   const router = useRouter();
+  const sp = useSearchParams();
 
-  const [loading, setLoading] = useState(true);
-  const [userEmail, setUserEmail] = useState<string>("");
+  // lê filtros da URL
+  const q0 = sp.get("q") ?? "";
+  const sector0 = sp.get("sector") ?? "";
+  const assignee0 = sp.get("assignee") ?? "";
+  const status0 = (sp.get("status") ?? "open") as "open" | "done" | "all";
+  const preset0 = sp.get("due") ?? "all"; // all | overdue | today | next7 | month | custom
+  const from0 = sp.get("from") ?? "";
+  const to0 = sp.get("to") ?? "";
+
+  // states
+  const [checkingAuth, setCheckingAuth] = useState(true);
   const [userId, setUserId] = useState<string>("");
 
-  const [tasks, setTasks] = useState<Task[]>([]);
-  const [errorMsg, setErrorMsg] = useState<string>("");
+  const [q, setQ] = useState(q0);
+  const [sector, setSector] = useState(sector0);
+  const [assignee, setAssignee] = useState(assignee0);
+  const [status, setStatus] = useState<"open" | "done" | "all">(status0);
+  const [duePreset, setDuePreset] = useState(preset0);
+  const [dueFrom, setDueFrom] = useState(from0);
+  const [dueTo, setDueTo] = useState(to0);
 
-  // filtros simples
-  const [fStatus, setFStatus] = useState<"all" | "open" | "done">("all");
-  const [fSector, setFSector] = useState<string>("all");
-  const [fType, setFType] = useState<string>("all");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string>("");
 
-  // form "nova task"
-  const [openNew, setOpenNew] = useState(false);
-  const [title, setTitle] = useState("");
-  const [notes, setNotes] = useState("");
-  const [priority, setPriority] = useState<string>("2");
-  const [sector, setSector] = useState("");
-  const [taskType, setTaskType] = useState("");
-  const [frequency, setFrequency] = useState("");
-  const [workdayOnly, setWorkdayOnly] = useState(true);
-  const [dueDate, setDueDate] = useState<string>("");
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [kpiRows, setKpiRows] = useState<KpiRow[]>([]);
 
-  async function signOut() {
-    await supabase.auth.signOut();
-    router.replace("/login");
+  const [sectors, setSectors] = useState<string[]>([]);
+  const [assignees, setAssignees] = useState<Array<{ email: string; name?: string }>>([]);
+
+  const today = useMemo(() => localISO(new Date()), []);
+  const next7 = useMemo(() => addDaysISO(today, 7), [today]);
+
+  function setUrl(next: Partial<Record<string, string>>) {
+    const params = new URLSearchParams(sp.toString());
+
+    Object.entries(next).forEach(([k, v]) => {
+      if (!v) params.delete(k);
+      else params.set(k, v);
+    });
+
+    // limpa combos inválidos
+    const due = params.get("due") ?? "all";
+    if (due !== "custom") {
+      params.delete("from");
+      params.delete("to");
+    }
+
+    const qs = params.toString();
+    router.replace(`/tasks${qs ? `?${qs}` : ""}`);
   }
 
-  async function loadMeAndTasks() {
-    setErrorMsg("");
-    setLoading(true);
+  function applyDuePreset(p: string) {
+    setDuePreset(p);
 
-    const { data: sessData, error: sessErr } = await supabase.auth.getSession();
-    if (sessErr) {
-      setLoading(false);
-      setErrorMsg(sessErr.message);
+    if (p === "custom") {
+      setUrl({ due: "custom" });
       return;
     }
 
-    const u = sessData.session?.user;
+    if (p === "overdue") {
+      setDueFrom("");
+      setDueTo(addDaysISO(today, -1));
+      setUrl({ due: "overdue" });
+      return;
+    }
+    if (p === "today") {
+      setDueFrom(today);
+      setDueTo(today);
+      setUrl({ due: "today" });
+      return;
+    }
+    if (p === "next7") {
+      setDueFrom(today);
+      setDueTo(next7);
+      setUrl({ due: "next7" });
+      return;
+    }
+    if (p === "month") {
+      setDueFrom(startOfMonthISO(today));
+      setDueTo(endOfMonthISO(today));
+      setUrl({ due: "month" });
+      return;
+    }
+
+    setDueFrom("");
+    setDueTo("");
+    setUrl({ due: "all" });
+  }
+
+  async function checkSession() {
+    const { data, error } = await supabase.auth.getSession();
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    const u = data.session?.user;
     if (!u) {
       router.replace("/login");
       return;
     }
-
-    setUserEmail(u.email || "");
     setUserId(u.id);
-
-    const { data, error } = await supabase
-      .from("tasks")
-      .select("*")
-      .order("created_at", { ascending: false });
-
-    if (error) setErrorMsg(error.message);
-    setTasks((data || []) as Task[]);
-    setLoading(false);
+    setCheckingAuth(false);
   }
 
   useEffect(() => {
-    loadMeAndTasks();
-
-    const { data: sub } = supabase.auth.onAuthStateChange(() => {
-      loadMeAndTasks();
-    });
-
-    return () => {
-      sub.subscription.unsubscribe();
-    };
+    checkSession();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const sectorOptions = useMemo(() => {
-    const s = new Set<string>();
-    tasks.forEach((t) => t.sector && s.add(t.sector));
-    return Array.from(s).sort();
-  }, [tasks]);
+  // carrega listas de filtros (Setor / Responsável)
+  useEffect(() => {
+    if (!userId) return;
 
-  const typeOptions = useMemo(() => {
-    const s = new Set<string>();
-    tasks.forEach((t) => t.task_type && s.add(t.task_type));
-    return Array.from(s).sort();
-  }, [tasks]);
+    (async () => {
+      const { data, error } = await supabase
+        .from("task_templates")
+        .select("sector, assignee_name, assignee_email")
+        .eq("user_id", userId);
 
-  const filtered = useMemo(() => {
-    return tasks.filter((t) => {
-      const stOk = fStatus === "all" ? true : (t.status as TaskStatus) === fStatus;
-      const secOk = fSector === "all" ? true : (t.sector || "") === fSector;
-      const typeOk = fType === "all" ? true : (t.task_type || "") === fType;
-      return stOk && secOk && typeOk;
-    });
-  }, [tasks, fStatus, fSector, fType]);
+      if (error) return;
 
-  async function createTask() {
-    setErrorMsg("");
+      const sec = new Set<string>();
+      const asg = new Map<string, { email: string; name?: string }>();
 
-    if (!title.trim()) {
-      setErrorMsg("Title is required.");
-      return;
+      (data || []).forEach((t: any) => {
+        const s = String(t.sector ?? "").trim();
+        if (s) sec.add(s);
+
+        const email = String(t.assignee_email ?? "").trim();
+        const name = String(t.assignee_name ?? "").trim();
+        if (email) asg.set(email, { email, name: name || undefined });
+      });
+
+      setSectors(Array.from(sec).sort((a, b) => a.localeCompare(b)));
+      setAssignees(Array.from(asg.values()).sort((a, b) => a.email.localeCompare(b.email)));
+    })();
+  }, [userId]);
+
+  // sempre que a URL mudar, reflete no state
+  useEffect(() => {
+    setQ(q0);
+    setSector(sector0);
+    setAssignee(assignee0);
+    setStatus(status0);
+    setDuePreset(preset0);
+    setDueFrom(from0);
+    setDueTo(to0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sp]);
+
+  function applyCommonFilters(query: any) {
+    // setor / responsavel (filtros em tabela relacionada)
+    if (sector) query = query.eq("task_templates.sector", sector);
+    if (assignee) query = query.eq("task_templates.assignee_email", assignee);
+
+    // busca (related table) — task_id e title
+    const qq = q.trim();
+    if (qq) {
+      query = query.or(`title.ilike.%${qq}%,task_id.ilike.%${qq}%`, {
+        foreignTable: "task_templates",
+      });
     }
-    if (!userId) {
-      setErrorMsg("Not authenticated.");
-      return;
+
+    // due/date presets
+    if (duePreset === "overdue") {
+      query = query.lt("due_date", today);
+    } else if (duePreset === "today") {
+      query = query.eq("due_date", today);
+    } else if (duePreset === "next7") {
+      query = query.gte("due_date", today).lte("due_date", next7);
+    } else if (duePreset === "month") {
+      const a = startOfMonthISO(today);
+      const b = endOfMonthISO(today);
+      query = query.gte("due_date", a).lte("due_date", b);
+    } else if (duePreset === "custom") {
+      if (dueFrom) query = query.gte("due_date", dueFrom);
+      if (dueTo) query = query.lte("due_date", dueTo);
     }
 
-    const payload = {
-      user_id: userId, // obrigatório por causa do RLS
-      title: title.trim(),
-      notes: notes.trim() ? notes.trim() : null,
-      priority: Number.isFinite(Number(priority)) ? Number(priority) : null,
+    return query;
+  }
+
+  async function fetchRuns() {
+    if (!userId) return;
+
+    setLoading(true);
+    setErr("");
+
+    try {
+      // 1) QUERY DA LISTA (respeita status)
+      let listQuery = supabase
+        .from("task_runs")
+        .select(
+          `
+          id,
+          template_id,
+          due_date,
+          done_at,
+          status,
+          template:task_templates!inner(
+            id,
+            task_id,
+            title,
+            sector,
+            frequency,
+            assignee_name,
+            assignee_email,
+            classification,
+            priority
+          )
+        `
+        )
+        .eq("user_id", userId)
+        .order("due_date", { ascending: true });
+
+      listQuery = applyCommonFilters(listQuery);
+
+      if (status !== "all") listQuery = listQuery.eq("status", status);
+
+      // 2) QUERY DOS KPIs (ignora status pra contadores ficarem “reais”)
+      let kpiQuery = supabase
+        .from("task_runs")
+        .select(
+          `
+          id,
+          due_date,
+          status,
+          template:task_templates!inner(id)
+        `
+        )
+        .eq("user_id", userId);
+
+      kpiQuery = applyCommonFilters(kpiQuery);
+
+      const [{ data: listData, error: listErr }, { data: kpiData, error: kpiErr }] =
+        await Promise.all([listQuery, kpiQuery]);
+
+      if (listErr) throw new Error(listErr.message);
+      if (kpiErr) throw new Error(kpiErr.message);
+
+      const normalized: Run[] = (listData as RunRow[]).map((r) => {
+        const t = Array.isArray(r.template) ? r.template[0] : r.template;
+        return {
+          id: r.id,
+          template_id: r.template_id,
+          due_date: r.due_date,
+          done_at: r.done_at,
+          status: r.status,
+          template: t ?? null,
+        };
+      });
+
+      const kpiNormalized: KpiRow[] = ((kpiData || []) as any[]).map((r) => ({
+        id: r.id,
+        due_date: r.due_date,
+        status: r.status,
+      }));
+
+      setRuns(normalized);
+      setKpiRows(kpiNormalized);
+    } catch (e: any) {
+      setErr(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!userId) return;
+    fetchRuns();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, q0, sector0, assignee0, status0, preset0, from0, to0]);
+
+  // KPIs baseados no kpiRows (não no runs) pra não “sumir done”
+  const kpis = useMemo(() => {
+    const total = kpiRows.length;
+    const open = kpiRows.filter((r) => r.status === "open").length;
+    const done = kpiRows.filter((r) => r.status === "done").length;
+    const overdue = kpiRows.filter((r) => r.status === "open" && r.due_date < today).length;
+    const dueToday = kpiRows.filter((r) => r.status === "open" && r.due_date === today).length;
+    const next7c = kpiRows.filter((r) => r.status === "open" && r.due_date >= today && r.due_date <= next7).length;
+    return { total, open, done, overdue, dueToday, next7: next7c };
+  }, [kpiRows, today, next7]);
+
+  function goKpi(kind: "total" | "open" | "overdue" | "today" | "next7" | "done") {
+    if (kind === "total") return setUrl({ status: "all", due: "all" });
+    if (kind === "open") return setUrl({ status: "open", due: "all" });
+    if (kind === "done") return setUrl({ status: "done", due: "all" });
+    if (kind === "overdue") return setUrl({ status: "open", due: "overdue" });
+    if (kind === "today") return setUrl({ status: "open", due: "today" });
+    if (kind === "next7") return setUrl({ status: "open", due: "next7" });
+  }
+
+  function kpiActive(kind: "total" | "open" | "overdue" | "today" | "next7" | "done") {
+    if (kind === "total") return status === "all" && duePreset === "all";
+    if (kind === "open") return status === "open" && duePreset === "all";
+    if (kind === "done") return status === "done" && duePreset === "all";
+    if (kind === "overdue") return status === "open" && duePreset === "overdue";
+    if (kind === "today") return status === "open" && duePreset === "today";
+    if (kind === "next7") return status === "open" && duePreset === "next7";
+    return false;
+  }
+
+  async function toggleDone(runId: string, makeDone: boolean) {
+    // otimista (pra ficar rápido)
+    setRuns((prev) =>
+      prev.map((r) =>
+        r.id === runId
+          ? {
+              ...r,
+              status: makeDone ? "done" : "open",
+              done_at: makeDone ? new Date().toISOString() : null,
+            }
+          : r
+      )
+    );
+
+    setKpiRows((prev) =>
+      prev.map((r) =>
+        r.id === runId
+          ? {
+              ...r,
+              status: makeDone ? "done" : "open",
+            }
+          : r
+      )
+    );
+
+    const patch = makeDone
+      ? { status: "done", done_at: new Date().toISOString() }
+      : { status: "open", done_at: null };
+
+    const { error } = await supabase.from("task_runs").update(patch).eq("id", runId);
+    if (error) {
+      await fetchRuns();
+      alert("Erro ao atualizar: " + error.message);
+    }
+  }
+
+  function clearFilters() {
+    setUrl({
+      q: "",
+      sector: "",
+      assignee: "",
       status: "open",
-      due_date: dueDate ? dueDate : null,
-      sector: sector.trim() ? sector.trim() : null,
-      task_type: taskType.trim() ? taskType.trim() : null,
-      frequency: frequency.trim() ? frequency.trim() : null,
-      workday_only: !!workdayOnly,
-      done_at: null,
-    };
-
-    const { error } = await supabase.from("tasks").insert(payload);
-    if (error) {
-      setErrorMsg(error.message);
-      return;
-    }
-
-    // limpa form
-    setTitle("");
-    setNotes("");
-    setPriority("2");
-    setSector("");
-    setTaskType("");
-    setFrequency("");
-    setWorkdayOnly(true);
-    setDueDate("");
-
-    setOpenNew(false);
-    await loadMeAndTasks();
+      due: "all",
+      from: "",
+      to: "",
+    });
   }
 
-  async function toggleDone(t: Task) {
-    setErrorMsg("");
-    const isDone = (t.status as TaskStatus) === "done";
-
-    const patch = isDone
-      ? { status: "open", done_at: null }
-      : { status: "done", done_at: new Date().toISOString() };
-
-    const { error } = await supabase.from("tasks").update(patch).eq("id", t.id);
-    if (error) {
-      setErrorMsg(error.message);
-      return;
-    }
-    await loadMeAndTasks();
-  }
-
-  async function deleteTask(t: Task) {
-    setErrorMsg("");
-    const { error } = await supabase.from("tasks").delete().eq("id", t.id);
-    if (error) {
-      setErrorMsg(error.message);
-      return;
-    }
-    await loadMeAndTasks();
+  if (checkingAuth) {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-sm opacity-70">
+        Loading...
+      </div>
+    );
   }
 
   return (
-    <main className="min-h-screen p-6">
-      <div className="mx-auto max-w-5xl space-y-4">
-        <Card>
-          <CardHeader className="flex flex-row items-center justify-between gap-3">
-            <div>
-              <CardTitle>Tasks</CardTitle>
-              <div className="text-xs opacity-70">Logged as: {userEmail || "..."}</div>
-            </div>
-            <div className="flex gap-2">
-              <Dialog open={openNew} onOpenChange={setOpenNew}>
-                <DialogTrigger asChild>
-                  <Button>New task</Button>
-                </DialogTrigger>
-                <DialogContent className="sm:max-w-xl">
-                  <DialogHeader>
-                    <DialogTitle>Create task</DialogTitle>
-                  </DialogHeader>
+    <div className="space-y-4">
+      <div className="flex items-start justify-between gap-3 flex-wrap">
+        <div>
+          <h1 className="text-xl font-semibold">Tasks</h1>
+          <div className="text-sm opacity-70">
+            Lista de execuções (runs) com filtros estilo ClickUp.
+          </div>
+        </div>
 
-                  <div className="space-y-3">
-                    <div className="space-y-2">
-                      <div className="text-sm font-medium">Title *</div>
-                      <Input value={title} onChange={(e) => setTitle(e.target.value)} />
-                    </div>
+        {/* KPIs CLICÁVEIS */}
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => goKpi("total")}
+            className={cx(
+              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
+              badgeClass("chip"),
+              kpiActive("total") && "ring-2 ring-primary/40"
+            )}
+            title="Show everything (status=all, due=all)"
+          >
+            Total: <b>{kpis.total}</b>
+          </button>
 
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                      <div className="space-y-2">
-                        <div className="text-sm font-medium">Priority</div>
-                        <Select value={priority} onValueChange={setPriority}>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Pick one" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="0">0 - Urgent</SelectItem>
-                            <SelectItem value="1">1 - Important</SelectItem>
-                            <SelectItem value="2">2 - Medium</SelectItem>
-                            <SelectItem value="3">3 - Low</SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
+          <button
+            type="button"
+            onClick={() => goKpi("open")}
+            className={cx(
+              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
+              badgeClass("open"),
+              kpiActive("open") && "ring-2 ring-primary/40"
+            )}
+            title="Show open tasks"
+          >
+            Open: <b>{kpis.open}</b>
+          </button>
 
-                      <div className="space-y-2">
-                        <div className="text-sm font-medium">Due date</div>
-                        <Input type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
-                      </div>
+          <button
+            type="button"
+            onClick={() => goKpi("overdue")}
+            className={cx(
+              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
+              badgeClass("overdue"),
+              kpiActive("overdue") && "ring-2 ring-primary/40"
+            )}
+            title="Show overdue open tasks"
+          >
+            Overdue: <b>{kpis.overdue}</b>
+          </button>
 
-                      <div className="space-y-2">
-                        <div className="text-sm font-medium">Workday only</div>
-                        <div className="flex items-center gap-2 pt-2">
-                          <Checkbox checked={workdayOnly} onCheckedChange={(v) => setWorkdayOnly(Boolean(v))} />
-                          <span className="text-sm opacity-80">Yes</span>
-                        </div>
-                      </div>
-                    </div>
+          <button
+            type="button"
+            onClick={() => goKpi("today")}
+            className={cx(
+              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
+              badgeClass("chip"),
+              kpiActive("today") && "ring-2 ring-primary/40"
+            )}
+            title="Show open tasks due today"
+          >
+            Today: <b>{kpis.dueToday}</b>
+          </button>
 
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                      <div className="space-y-2">
-                        <div className="text-sm font-medium">Sector</div>
-                        <Input value={sector} onChange={(e) => setSector(e.target.value)} placeholder="e.g. Contas a Pagar" />
-                      </div>
-                      <div className="space-y-2">
-                        <div className="text-sm font-medium">Type</div>
-                        <Input value={taskType} onChange={(e) => setTaskType(e.target.value)} placeholder="e.g. Entrega" />
-                      </div>
-                      <div className="space-y-2">
-                        <div className="text-sm font-medium">Frequency</div>
-                        <Input value={frequency} onChange={(e) => setFrequency(e.target.value)} placeholder="e.g. Mensal" />
-                      </div>
-                    </div>
+          <button
+            type="button"
+            onClick={() => goKpi("next7")}
+            className={cx(
+              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
+              badgeClass("chip"),
+              kpiActive("next7") && "ring-2 ring-primary/40"
+            )}
+            title="Show open tasks due in the next 7 days"
+          >
+            Next 7d: <b>{kpis.next7}</b>
+          </button>
 
-                    <div className="space-y-2">
-                      <div className="text-sm font-medium">Notes</div>
-                      <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} />
-                    </div>
+          <button
+            type="button"
+            onClick={() => goKpi("done")}
+            className={cx(
+              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
+              badgeClass("done"),
+              kpiActive("done") && "ring-2 ring-primary/40"
+            )}
+            title="Show done tasks"
+          >
+            Done: <b>{kpis.done}</b>
+          </button>
+        </div>
+      </div>
 
-                    <div className="flex justify-end gap-2 pt-2">
-                      <Button variant="outline" onClick={() => setOpenNew(false)}>
-                        Cancel
-                      </Button>
-                      <Button onClick={createTask}>Create</Button>
-                    </div>
-                  </div>
-                </DialogContent>
-              </Dialog>
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Filters</CardTitle>
+        </CardHeader>
 
-              <Button variant="outline" onClick={signOut}>
-                Sign out
-              </Button>
-            </div>
-          </CardHeader>
-
-          <CardContent className="space-y-3">
-            {errorMsg ? <div className="text-sm text-red-600">{errorMsg}</div> : null}
-
-            <div className="flex flex-wrap gap-2 items-center">
-              <div className="text-sm opacity-70 mr-2">Filters:</div>
-
-              <Select value={fStatus} onValueChange={(v) => setFStatus(v as any)}>
-                <SelectTrigger className="w-[160px]">
-                  <SelectValue placeholder="Status" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All</SelectItem>
-                  <SelectItem value="open">Open</SelectItem>
-                  <SelectItem value="done">Done</SelectItem>
-                </SelectContent>
-              </Select>
-
-              <Select value={fSector} onValueChange={setFSector}>
-                <SelectTrigger className="w-[220px]">
-                  <SelectValue placeholder="Sector" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All</SelectItem>
-                  {sectorOptions.map((s) => (
-                    <SelectItem key={s} value={s}>
-                      {s}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-
-              <Select value={fType} onValueChange={setFType}>
-                <SelectTrigger className="w-[220px]">
-                  <SelectValue placeholder="Type" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All</SelectItem>
-                  {typeOptions.map((t) => (
-                    <SelectItem key={t} value={t}>
-                      {t}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-
-              <div className="ml-auto text-sm opacity-70">
-                {loading ? "Loading..." : `${filtered.length} task(s)`}
+        <CardContent className="space-y-3">
+          <div className="grid grid-cols-12 gap-2">
+            {/* Search */}
+            <div className="col-span-12 lg:col-span-4">
+              <div className="text-xs opacity-70 mb-1">Search (Task_ID or Title)</div>
+              <div className="flex gap-2">
+                <Input
+                  value={q}
+                  onChange={(e) => setQ(e.target.value)}
+                  placeholder="ex: CL-DE-000011 ou conciliação..."
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") setUrl({ q: q.trim() });
+                  }}
+                />
+                <Button variant="secondary" onClick={() => setUrl({ q: q.trim() })}>
+                  Apply
+                </Button>
               </div>
             </div>
 
-            <div className="rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Title</TableHead>
-                    <TableHead>Meta</TableHead>
-                    <TableHead>Due</TableHead>
-                    <TableHead className="text-right">Actions</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {filtered.map((t) => {
-                    const st = (t.status as TaskStatus) === "done" ? "done" : "open";
-                    const pr = t.priority ?? 2;
+            {/* Sector */}
+            <div className="col-span-12 sm:col-span-6 lg:col-span-2">
+              <div className="text-xs opacity-70 mb-1">Sector</div>
+              <select
+                value={sector}
+                onChange={(e) => setUrl({ sector: e.target.value })}
+                className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+              >
+                <option value="">All</option>
+                {sectors.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Assignee */}
+            <div className="col-span-12 sm:col-span-6 lg:col-span-3">
+              <div className="text-xs opacity-70 mb-1">Assignee</div>
+              <select
+                value={assignee}
+                onChange={(e) => setUrl({ assignee: e.target.value })}
+                className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+              >
+                <option value="">All</option>
+                {assignees.map((a) => (
+                  <option key={a.email} value={a.email}>
+                    {a.name ? `${a.name} — ${a.email}` : a.email}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Status */}
+            <div className="col-span-12 sm:col-span-6 lg:col-span-1">
+              <div className="text-xs opacity-70 mb-1">Status</div>
+              <select
+                value={status}
+                onChange={(e) => setUrl({ status: e.target.value })}
+                className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+              >
+                <option value="open">Open</option>
+                <option value="done">Done</option>
+                <option value="all">All</option>
+              </select>
+            </div>
+
+            {/* Due preset */}
+            <div className="col-span-12 sm:col-span-6 lg:col-span-2">
+              <div className="text-xs opacity-70 mb-1">Due</div>
+              <select
+                value={duePreset}
+                onChange={(e) => applyDuePreset(e.target.value)}
+                className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+              >
+                <option value="all">All</option>
+                <option value="overdue">Overdue</option>
+                <option value="today">Today</option>
+                <option value="next7">Next 7 days</option>
+                <option value="month">This month</option>
+                <option value="custom">Custom range</option>
+              </select>
+            </div>
+
+            {/* Custom range */}
+            {duePreset === "custom" && (
+              <div className="col-span-12 lg:col-span-4">
+                <div className="text-xs opacity-70 mb-1">Custom range</div>
+                <div className="flex gap-2 items-center">
+                  <Input
+                    type="date"
+                    value={dueFrom}
+                    onChange={(e) => {
+                      setDueFrom(e.target.value);
+                      setUrl({ due: "custom", from: e.target.value, to: dueTo });
+                    }}
+                  />
+                  <span className="text-xs opacity-60">to</span>
+                  <Input
+                    type="date"
+                    value={dueTo}
+                    onChange={(e) => {
+                      setDueTo(e.target.value);
+                      setUrl({ due: "custom", from: dueFrom, to: e.target.value });
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Actions */}
+            <div className="col-span-12 flex items-end gap-2">
+              <Button variant="outline" onClick={clearFilters}>
+                Clear filters
+              </Button>
+              <Button variant="outline" onClick={fetchRuns} disabled={loading}>
+                Refresh
+              </Button>
+            </div>
+          </div>
+
+          {err && (
+            <div className="text-sm text-rose-600 border border-rose-200 bg-rose-50 rounded-md p-3">
+              {err}
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Results</CardTitle>
+        </CardHeader>
+
+        <CardContent>
+          {loading ? (
+            <div className="text-sm opacity-70">Loading...</div>
+          ) : runs.length === 0 ? (
+            <div className="text-sm opacity-70">Nada encontrado com esses filtros.</div>
+          ) : (
+            <div className="overflow-auto border rounded-md">
+              <table className="min-w-[980px] w-full text-sm">
+                <thead className="bg-muted/50">
+                  <tr className="text-left">
+                    <th className="p-3">Status</th>
+                    <th className="p-3">Due</th>
+                    <th className="p-3">Task_ID</th>
+                    <th className="p-3">Title</th>
+                    <th className="p-3">Sector</th>
+                    <th className="p-3">Frequency</th>
+                    <th className="p-3">Assignee</th>
+                    <th className="p-3">Action</th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {runs.map((r) => {
+                    const t = r.template;
+                    const overdue = r.status === "open" && r.due_date < today;
 
                     return (
-                      <TableRow key={t.id} className={st === "done" ? "opacity-70" : ""}>
-                        <TableCell>
-                          <Badge variant={st === "done" ? "secondary" : "default"}>
-                            {st.toUpperCase()}
-                          </Badge>
-                        </TableCell>
-                        <TableCell className="font-medium">{t.title}</TableCell>
-                        <TableCell className="text-xs opacity-80">
-                          <div>Priority: {pr} ({PRIORITY_LABEL[pr] || "n/a"})</div>
-                          <div>{t.sector ? `Sector: ${t.sector}` : ""}</div>
-                          <div>{t.task_type ? `Type: ${t.task_type}` : ""}</div>
-                          <div>{t.frequency ? `Frequency: ${t.frequency}` : ""}</div>
-                          <div>{t.workday_only ? "Workday only" : "Any day"}</div>
-                        </TableCell>
-                        <TableCell className="text-sm">{fmtDate(t.due_date)}</TableCell>
-                        <TableCell className="text-right space-x-2">
-                          <Button size="sm" variant="outline" onClick={() => toggleDone(t)}>
-                            {st === "done" ? "Reopen" : "Complete"}
-                          </Button>
-                          <Button size="sm" variant="destructive" onClick={() => deleteTask(t)}>
-                            Delete
-                          </Button>
-                        </TableCell>
-                      </TableRow>
+                      <tr key={r.id} className="border-t">
+                        <td className="p-3">
+                          <span
+                            className={cx(
+                              "text-xs px-2 py-1 rounded border",
+                              overdue ? badgeClass("overdue") : badgeClass(r.status)
+                            )}
+                          >
+                            {overdue ? "OVERDUE" : r.status.toUpperCase()}
+                          </span>
+                        </td>
+
+                        <td className="p-3 font-medium">{r.due_date}</td>
+
+                        <td className="p-3">
+                          <span className="font-mono text-xs">{t?.task_id ?? "—"}</span>
+                        </td>
+
+                        <td className="p-3">
+                          <div className="font-medium">{t?.title ?? "—"}</div>
+                          <div className="text-xs opacity-70">
+                            {t?.classification ? `Class: ${t.classification}` : ""}
+                          </div>
+                        </td>
+
+                        <td className="p-3">{t?.sector ?? "—"}</td>
+                        <td className="p-3">{t?.frequency ?? "—"}</td>
+
+                        <td className="p-3">
+                          <div className="text-sm">{t?.assignee_name || "—"}</div>
+                          <div className="text-xs opacity-70">{t?.assignee_email || ""}</div>
+                        </td>
+
+                        <td className="p-3">
+                          {r.status === "open" ? (
+                            <Button size="sm" onClick={() => toggleDone(r.id, true)} className="h-8">
+                              Complete
+                            </Button>
+                          ) : (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() => toggleDone(r.id, false)}
+                              className="h-8"
+                            >
+                              Reopen
+                            </Button>
+                          )}
+                        </td>
+                      </tr>
                     );
                   })}
-
-                  {!loading && filtered.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={5} className="text-center text-sm opacity-70 py-10">
-                        No tasks yet. Click <b>New task</b>.
-                      </TableCell>
-                    </TableRow>
-                  ) : null}
-                </TableBody>
-              </Table>
+                </tbody>
+              </table>
             </div>
-          </CardContent>
-        </Card>
-      </div>
-    </main>
+          )}
+        </CardContent>
+      </Card>
+    </div>
   );
 }

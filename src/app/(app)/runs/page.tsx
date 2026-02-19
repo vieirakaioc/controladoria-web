@@ -143,6 +143,7 @@ export default function RunsPage() {
   const [rangeDays, setRangeDays] = useState<number>(30);
   const [busyGen, setBusyGen] = useState(false);
   const [busyClear, setBusyClear] = useState(false);
+  const [busyClearAll, setBusyClearAll] = useState(false);
 
   async function requireUser() {
     const { data: sessData, error } = await supabase.auth.getSession();
@@ -199,35 +200,67 @@ export default function RunsPage() {
     await loadRuns();
   }
 
-  async function clearRunsRange() {
+  // ✅ NOVO: delete genérico (range OU tudo)
+  async function clearRuns(opts?: { from?: string; to?: string }) {
     setErrorMsg("");
     const u = await requireUser();
     if (!u) return;
 
-    const start = todayISO();
-    const end = addDaysISO(start, rangeDays);
+    const from = (opts?.from || "").trim();
+    const to = (opts?.to || "").trim();
 
-    const ok = confirm(
-      `Vai apagar TODAS as runs do seu usuário no range:\n${start} até ${end}\n\nConfirma?`
-    );
+    const scopeText =
+      from || to
+        ? `no range:\n${from || "(sem início)"} até ${to || "(sem fim)"}`
+        : `TODAS as runs do seu usuário (sem filtro de data)`;
+
+    // conta antes (pra confirmar com número real)
+    let countQuery = supabase
+      .from("task_runs")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", u.id);
+
+    if (from) countQuery = countQuery.gte("due_date", from);
+    if (to) countQuery = countQuery.lte("due_date", to);
+
+    const { count, error: countErr } = await countQuery;
+    if (countErr) {
+      setErrorMsg(countErr.message);
+      return;
+    }
+
+    const ok = confirm(`Vai apagar ${count ?? 0} runs ${scopeText}.\n\nConfirma?`);
     if (!ok) return;
 
-    setBusyClear(true);
-    try {
-      const { error } = await supabase
-        .from("task_runs")
-        .delete()
-        .eq("user_id", u.id)
-        .gte("due_date", start)
-        .lte("due_date", end);
+    // flags de busy (pra UI)
+    if (from || to) setBusyClear(true);
+    else setBusyClearAll(true);
 
+    try {
+      let delQuery = supabase.from("task_runs").delete().eq("user_id", u.id);
+      if (from) delQuery = delQuery.gte("due_date", from);
+      if (to) delQuery = delQuery.lte("due_date", to);
+
+      const { error } = await delQuery;
       if (error) throw new Error(error.message);
+
       await loadRuns();
     } catch (e: any) {
       setErrorMsg(e?.message || String(e));
     } finally {
       setBusyClear(false);
+      setBusyClearAll(false);
     }
+  }
+
+  async function clearRunsRange() {
+    const start = todayISO();
+    const end = addDaysISO(start, rangeDays);
+    await clearRuns({ from: start, to: end });
+  }
+
+  async function clearRunsAll() {
+    await clearRuns(); // sem from/to => apaga tudo
   }
 
   async function generateRuns() {
@@ -389,7 +422,9 @@ export default function RunsPage() {
                   type="number"
                   className="w-24"
                   value={rangeDays}
-                  onChange={(e) => setRangeDays(Math.max(1, Math.min(365, Number(e.target.value || 30))))}
+                  onChange={(e) =>
+                    setRangeDays(Math.max(1, Math.min(365, Number(e.target.value || 30))))
+                  }
                 />
               </div>
 
@@ -397,17 +432,20 @@ export default function RunsPage() {
                 {busyGen ? "Generating..." : `Generate runs (${rangeDays}d)`}
               </Button>
 
-              <Button variant="outline" onClick={clearRunsRange} disabled={busyClear}>
+              <Button variant="outline" onClick={clearRunsRange} disabled={busyClear || busyClearAll}>
                 {busyClear ? "Clearing..." : `Clear runs (${rangeDays}d)`}
+              </Button>
+
+              {/* ✅ NOVO BOTÃO: APAGAR TUDO */}
+              <Button variant="destructive" onClick={clearRunsAll} disabled={busyClear || busyClearAll}>
+                {busyClearAll ? "Deleting..." : "Delete ALL"}
               </Button>
             </div>
           </CardHeader>
 
           <CardContent className="space-y-3">
             {errorMsg ? <div className="text-sm text-red-600">{errorMsg}</div> : null}
-            <div className="text-sm opacity-70">
-              {loading ? "Loading..." : `${ordered.length} run(s)`}
-            </div>
+            <div className="text-sm opacity-70">{loading ? "Loading..." : `${ordered.length} run(s)`}</div>
 
             <div className="rounded-md border">
               <Table>

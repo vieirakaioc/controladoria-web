@@ -20,7 +20,6 @@ function stripAccentsLower(v: any) {
 }
 
 function norm(v: any) {
-  // trim + colapsa espaços
   return String(v ?? "")
     .replace(/\u00A0/g, " ")
     .replace(/\s+/g, " ")
@@ -34,15 +33,6 @@ function asInt(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
-function clampInt(v: number | null, min: number, max: number) {
-  if (v == null) return null;
-  if (!Number.isFinite(v)) return null;
-  if (v < min) return min;
-  if (v > max) return max;
-  return v;
-}
-
-// aceita: 1..7 ou "seg/segunda/mon", "ter/terça/tue", ..., "sex/sexta/fri", "sab/sábado/sat", "dom/sun"
 function parseWeekday(v: any): number | null {
   if (v === null || v === undefined) return null;
 
@@ -53,40 +43,13 @@ function parseWeekday(v: any): number | null {
   if (!s) return null;
 
   const map: Record<string, number> = {
-    seg: 1,
-    segunda: 1,
-    monday: 1,
-    mon: 1,
-
-    ter: 2,
-    terca: 2,
-    tuesday: 2,
-    tue: 2,
-
-    qua: 3,
-    quarta: 3,
-    wednesday: 3,
-    wed: 3,
-
-    qui: 4,
-    quinta: 4,
-    thursday: 4,
-    thu: 4,
-
-    sex: 5,
-    sexta: 5,
-    friday: 5,
-    fri: 5,
-
-    sab: 6,
-    sabado: 6,
-    saturday: 6,
-    sat: 6,
-
-    dom: 7,
-    domingo: 7,
-    sunday: 7,
-    sun: 7,
+    seg: 1, segunda: 1, monday: 1, mon: 1,
+    ter: 2, terca: 2, tuesday: 2, tue: 2,
+    qua: 3, quarta: 3, wednesday: 3, wed: 3,
+    qui: 4, quinta: 4, thursday: 4, thu: 4,
+    sex: 5, sexta: 5, friday: 5, fri: 5,
+    sab: 6, sabado: 6, saturday: 6, sat: 6,
+    dom: 7, domingo: 7, sunday: 7, sun: 7,
   };
 
   const first = s.split(/[\s\-_/]+/)[0];
@@ -130,7 +93,6 @@ function toISODate(v: any): string | null {
   return null;
 }
 
-// chave do template (pra dedup e pra mapear runs)
 function tplKey(planner: string, sector: string, title: string) {
   return `${planner}|${sector}|${title}`.toLowerCase();
 }
@@ -138,115 +100,42 @@ function runKey(templateId: string, dueDate: string) {
   return `${templateId}|${dueDate}`;
 }
 
-/**
- * Mapeia a coluna "Frequencia" para regras.
- *
- * DIA ÚTIL (sua coluna):
- * - mensal/bimestral/trimestral/anual -> Dia Util = N do dia útil do mês (ex: 5 = 5º dia útil)
- * - semanal/quinzenal -> se NÃO tiver Dia Semana, usa Dia Util como weekday (1..7)
- *
- * Quinzenal vira schedule_kind="biweekly" (pra regra 1ª e 3ª ocorrência do weekday no mês no /runs).
- */
 function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: number | null) {
   const f = stripAccentsLower(freqRaw);
 
-  // defaults corporativos
-  const defaultWorkdayN = clampInt(diaUtilN, 1, 31) ?? 5;
+  const defaultWorkdayN = diaUtilN ?? 5;
+  const defaultWeekday = diaSemana ?? 5;
 
-  // weekday: prioridade é Dia Semana; se não tiver, tenta Dia Util (1..7); senão Friday (5)
-  const inferredWeekdayFromDiaUtil = clampInt(diaUtilN, 1, 7);
-  const defaultWeekday = clampInt(diaSemana, 1, 7) ?? inferredWeekdayFromDiaUtil ?? 5;
-
-  // diária (Mon-Fri)
   if (f.includes("diaria")) {
-    return {
-      schedule_kind: "daily",
-      schedule_every: 1,
-      due_weekday: null,
-      due_day: null,
-      workday_only: true,
-    };
+    return { schedule_kind: "daily", schedule_every: 1, due_weekday: null, due_day: null, workday_only: true };
   }
-
-  // quinzenal (1ª e 3ª ocorrência do weekday no mês - tratado no /runs)
   if (f.includes("quinzenal")) {
-    return {
-      schedule_kind: "biweekly",
-      schedule_every: 1,
-      due_weekday: defaultWeekday,
-      due_day: null,
-      workday_only: true,
-    };
+    return { schedule_kind: "biweekly", schedule_every: 1, due_weekday: defaultWeekday, due_day: null, workday_only: true };
   }
-
-  // semanal
   if (f.includes("semanal")) {
-    return {
-      schedule_kind: "weekly",
-      schedule_every: 1,
-      due_weekday: defaultWeekday,
-      due_day: null,
-      workday_only: true,
-    };
+    return { schedule_kind: "weekly", schedule_every: 1, due_weekday: defaultWeekday, due_day: null, workday_only: true };
   }
-
-  // mensal / bimestral / trimestral / anual (por dia útil N)
   if (f.includes("bimestral")) {
-    return {
-      schedule_kind: "monthly",
-      schedule_every: 2,
-      due_weekday: null,
-      due_day: defaultWorkdayN,
-      workday_only: true,
-    };
+    return { schedule_kind: "monthly", schedule_every: 2, due_weekday: null, due_day: defaultWorkdayN, workday_only: true };
   }
   if (f.includes("trimestral")) {
-    return {
-      schedule_kind: "monthly",
-      schedule_every: 3,
-      due_weekday: null,
-      due_day: defaultWorkdayN,
-      workday_only: true,
-    };
+    return { schedule_kind: "monthly", schedule_every: 3, due_weekday: null, due_day: defaultWorkdayN, workday_only: true };
   }
   if (f.includes("anual")) {
-    return {
-      schedule_kind: "monthly",
-      schedule_every: 12,
-      due_weekday: null,
-      due_day: defaultWorkdayN,
-      workday_only: true,
-    };
+    return { schedule_kind: "monthly", schedule_every: 12, due_weekday: null, due_day: defaultWorkdayN, workday_only: true };
   }
   if (f.includes("mensal")) {
-    return {
-      schedule_kind: "monthly",
-      schedule_every: 1,
-      due_weekday: null,
-      due_day: defaultWorkdayN,
-      workday_only: true,
-    };
+    return { schedule_kind: "monthly", schedule_every: 1, due_weekday: null, due_day: defaultWorkdayN, workday_only: true };
   }
-
-  // pontual
   if (f.includes("pontual")) {
-    return {
-      schedule_kind: "once",
-      schedule_every: 1,
-      due_weekday: null,
-      due_day: null,
-      workday_only: false,
-    };
+    return { schedule_kind: "once", schedule_every: 1, due_weekday: null, due_day: null, workday_only: false };
   }
 
-  // fallback: mensal dia útil
-  return {
-    schedule_kind: "monthly",
-    schedule_every: 1,
-    due_weekday: null,
-    due_day: defaultWorkdayN,
-    workday_only: true,
-  };
+  return { schedule_kind: "monthly", schedule_every: 1, due_weekday: null, due_day: defaultWorkdayN, workday_only: true };
+}
+
+function sheetKey(name: string) {
+  return stripAccentsLower(name).replace(/\s+/g, "").replace(/-/g, "_");
 }
 
 export default function ImportPage() {
@@ -258,6 +147,56 @@ export default function ImportPage() {
 
   function append(s: string) {
     setLog((p) => (p ? p + "\n" + s : s));
+  }
+
+  async function upsertPeopleFromListBox(wb: XLSX.WorkBook, userId: string) {
+    const sheetPeople =
+      wb.SheetNames.find((n) => sheetKey(n) === "list_box" || sheetKey(n) === "listbox") || "";
+
+    if (!sheetPeople) {
+      append("People: aba List_box não encontrada (ok).");
+      return;
+    }
+
+    const wsP = wb.Sheets[sheetPeople];
+    const rowsP = XLSX.utils.sheet_to_json<Row>(wsP, { defval: "" });
+
+    const list: Array<{ user_id: string; name: string; email: string; active: boolean }> = [];
+    const seen = new Set<string>();
+
+    for (const r of rowsP) {
+      const name =
+        norm(r["Responsável"] || r["Responsavel"] || r["Nome"] || r["Name"] || "");
+      const email =
+        norm(r["e-mail"] || r["E-mail"] || r["Email"] || r["email"] || "");
+
+      if (!name || !email) continue;
+
+      const key = `${userId}|${email}`.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      list.push({ user_id: userId, name, email, active: true });
+    }
+
+    if (list.length === 0) {
+      append(`People: List_box (${rowsP.length} linhas) sem registros válidos.`);
+      return;
+    }
+
+    append(`People: importando da aba ${sheetPeople} (${list.length} pessoas)...`);
+
+    const chunkSize = 200;
+    for (let i = 0; i < list.length; i += chunkSize) {
+      const chunk = list.slice(i, i + chunkSize);
+      const { error } = await supabase
+        .from("people")
+        .upsert(chunk, { onConflict: "user_id,email" });
+
+      if (error) throw new Error("People upsert: " + error.message);
+    }
+
+    append("People: ✅ atualizado.");
   }
 
   async function runImport() {
@@ -279,6 +218,9 @@ export default function ImportPage() {
       append("Lendo Excel...");
       const ab = await file.arrayBuffer();
       const wb = XLSX.read(ab, { type: "array" });
+
+      // ✅ 0) People (List_box)
+      await upsertPeopleFromListBox(wb, u.id);
 
       const sheetTemplates =
         wb.SheetNames.includes("Lista")
@@ -306,18 +248,15 @@ export default function ImportPage() {
 
           const frequency = norm(r["Frequencia"] || r["Frequência"] || "");
           const classification = norm(r["Classificação"] || "");
-          const assignee_name = norm(r["Responsável"] || "");
+          const assignee_name = norm(r["Responsável"] || r["Responsavel"] || "");
           const assignee_email = norm(r["e-mail"] || r["e-mail responsavel"] || r["email"] || "");
 
-          // SUA COLUNA: Dia Útil
           const diaUtilN =
             asInt(r["Dia Util"]) ??
             asInt(r["Dia Útil"]) ??
             asInt(r["Dia_Util_N"]) ??
             null;
 
-          // DIA DA SEMANA (opcional): número 1..7 OU texto "sexta", "seg" etc.
-          // Se não tiver, semanal/quinzenal tentam usar Dia Util (1..7); senão Friday (5).
           const diaSemana =
             parseWeekday(r["Dia Semana"]) ??
             parseWeekday(r["Dia_Semana"]) ??
@@ -349,7 +288,6 @@ export default function ImportPage() {
             assignee_name: assignee_name || null,
             assignee_email: assignee_email || null,
 
-            // deixa null: trigger gera automático
             task_id: null,
           };
         })
@@ -367,11 +305,9 @@ export default function ImportPage() {
           tplDup++;
           const prev = tplMap.get(k);
 
-          // "último ganha" nas regras
           tplMap.set(k, {
             ...prev,
             ...t,
-            // mas mantém o que não veio preenchido
             task_type: t.task_type ?? prev.task_type,
             notes: t.notes ?? prev.notes,
             priority: t.priority ?? prev.priority,
@@ -397,9 +333,7 @@ export default function ImportPage() {
           .upsert(chunk, { onConflict: "user_id,planner,sector,title" });
 
         if (error) throw new Error(error.message);
-        append(
-          `Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`
-        );
+        append(`Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`);
       }
 
       append("Buscando IDs dos templates pra mapear runs...");
@@ -504,7 +438,6 @@ export default function ImportPage() {
 
       append("✅ Importação concluída!");
       append("Agora vai em /runs e clica Generate runs (30d) pra criar vencimentos automáticos.");
-      append("Obs: Sem 'Dia Semana': Semanal/Quinzenal usam 'Dia Util' (1..7) como weekday; se não der, cai em Friday (5).");
     } catch (e: any) {
       append("❌ ERRO: " + (e?.message || String(e)));
     } finally {
@@ -517,7 +450,7 @@ export default function ImportPage() {
       <div className="mx-auto max-w-3xl space-y-4">
         <Card>
           <CardHeader>
-            <CardTitle>Import Excel (Templates + Runs)</CardTitle>
+            <CardTitle>Import Excel (Templates + Runs + People)</CardTitle>
           </CardHeader>
 
           <CardContent className="space-y-3">
@@ -536,12 +469,6 @@ export default function ImportPage() {
             <pre className="text-xs whitespace-pre-wrap rounded-md border p-3 min-h-[160px]">
               {log || "Log vai aparecer aqui..."}
             </pre>
-
-            <div className="text-xs opacity-70">
-              Regras:
-              <br />- <b>Mensal/Bimestral/Trimestral/Anual</b>: <b>Dia Util</b> = Nº do dia útil do mês (ex: 5 = 5º).
-              <br />- <b>Semanal/Quinzenal</b>: se não tiver <b>Dia Semana</b>, usa <b>Dia Util</b> como weekday (1=Mon..7=Sun).
-            </div>
           </CardContent>
         </Card>
       </div>
