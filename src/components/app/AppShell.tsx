@@ -83,8 +83,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // ✅ ADD /runs em Setup
   const navAdmin: NavItem[] = useMemo(
     () => [
-      { href: "/runs", label: "Runs", icon: CalendarCheck2 },
       { href: "/templates", label: "Templates", icon: Settings },
+      { href: "/runs", label: "Runs", icon: CalendarCheck2 },
       { href: "/import", label: "Import", icon: Upload },
       { href: "/people", label: "People", icon: Users },
     ],

@@ -94,6 +94,26 @@ export default function TasksPage() {
   const from0 = sp.get("from") ?? "";
   const to0 = sp.get("to") ?? "";
 
+  // ✅ planner automático (?planner=... ou localStorage ctx.plannerName)
+  const [plannerName, setPlannerName] = useState<string>("");
+
+  function readPlannerFromCtx() {
+    const qp = (sp.get("planner") || "").trim();
+    if (qp) return qp;
+
+    try {
+      return (localStorage.getItem("ctx.plannerName") || "").trim();
+    } catch {
+      return "";
+    }
+  }
+
+  function persistPlannerToCtx(v: string) {
+    try {
+      localStorage.setItem("ctx.plannerName", v);
+    } catch {}
+  }
+
   // states
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [userId, setUserId] = useState<string>("");
@@ -117,6 +137,14 @@ export default function TasksPage() {
 
   const today = useMemo(() => localISO(new Date()), []);
   const next7 = useMemo(() => addDaysISO(today, 7), [today]);
+
+  // ✅ sempre que URL mudar, recalcula planner e persiste se vier por querystring
+  useEffect(() => {
+    const p = readPlannerFromCtx();
+    setPlannerName(p);
+    if (p && sp.get("planner")) persistPlannerToCtx(p);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sp]);
 
   function setUrl(next: Partial<Record<string, string>>) {
     const params = new URLSearchParams(sp.toString());
@@ -200,11 +228,15 @@ export default function TasksPage() {
     if (!userId) return;
 
     (async () => {
-      const { data, error } = await supabase
+      let qTpl = supabase
         .from("task_templates")
         .select("sector, assignee_name, assignee_email")
         .eq("user_id", userId);
 
+      // ✅ filtra por planner automaticamente (se tiver)
+      if (plannerName) qTpl = qTpl.eq("planner", plannerName);
+
+      const { data, error } = await qTpl;
       if (error) return;
 
       const sec = new Set<string>();
@@ -222,7 +254,7 @@ export default function TasksPage() {
       setSectors(Array.from(sec).sort((a, b) => a.localeCompare(b)));
       setAssignees(Array.from(asg.values()).sort((a, b) => a.email.localeCompare(b.email)));
     })();
-  }, [userId]);
+  }, [userId, plannerName]);
 
   // sempre que a URL mudar, reflete no state
   useEffect(() => {
@@ -237,6 +269,9 @@ export default function TasksPage() {
   }, [sp]);
 
   function applyCommonFilters(query: any) {
+    // ✅ filtro automático por planner (tabela relacionada)
+    if (plannerName) query = query.eq("task_templates.planner", plannerName);
+
     // setor / responsavel (filtros em tabela relacionada)
     if (sector) query = query.eq("task_templates.sector", sector);
     if (assignee) query = query.eq("task_templates.assignee_email", assignee);
@@ -294,7 +329,8 @@ export default function TasksPage() {
             assignee_name,
             assignee_email,
             classification,
-            priority
+            priority,
+            planner
           )
         `
         )
@@ -313,7 +349,7 @@ export default function TasksPage() {
           id,
           due_date,
           status,
-          template:task_templates!inner(id)
+          template:task_templates!inner(id, planner)
         `
         )
         .eq("user_id", userId);
@@ -357,7 +393,7 @@ export default function TasksPage() {
     if (!userId) return;
     fetchRuns();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, q0, sector0, assignee0, status0, preset0, from0, to0]);
+  }, [userId, plannerName, q0, sector0, assignee0, status0, preset0, from0, to0]);
 
   // KPIs baseados no kpiRows (não no runs) pra não “sumir done”
   const kpis = useMemo(() => {

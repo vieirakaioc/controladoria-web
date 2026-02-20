@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -25,6 +25,7 @@ type Tpl = {
   frequency: string | null;
   assignee_name?: string | null;
   assignee_email?: string | null;
+  planner?: string | null; // ✅ pra filtro automático
 };
 
 function tplOf(r: RunRow): Tpl | null {
@@ -101,9 +102,37 @@ function StatPill({
 
 export default function BoardPage() {
   const router = useRouter();
+  const sp = useSearchParams();
 
   const [busy, setBusy] = useState(false);
   const [runs, setRuns] = useState<RunRow[]>([]);
+
+  // ✅ planner automático (?planner=... ou localStorage ctx.plannerName)
+  const [plannerName, setPlannerName] = useState<string>("");
+
+  function readPlannerFromCtx() {
+    const qp = (sp.get("planner") || "").trim();
+    if (qp) return qp;
+
+    try {
+      return (localStorage.getItem("ctx.plannerName") || "").trim();
+    } catch {
+      return "";
+    }
+  }
+
+  function persistPlannerToCtx(v: string) {
+    try {
+      localStorage.setItem("ctx.plannerName", v);
+    } catch {}
+  }
+
+  useEffect(() => {
+    const p = readPlannerFromCtx();
+    setPlannerName(p);
+    if (p && sp.get("planner")) persistPlannerToCtx(p);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sp]);
 
   // filtros (igual teu board)
   const [search, setSearch] = useState("");
@@ -123,13 +152,14 @@ export default function BoardPage() {
 
       const uid = sess.session.user.id;
 
-      const { data, error } = await supabase
+      // ✅ importante: usar !inner pra permitir filtro por tabela relacionada
+      let q = supabase
         .from("task_runs")
         .select(
           `
           id, user_id, template_id, due_date, status, done_at,
-          task_templates (
-            task_id, title, sector, frequency, assignee_name, assignee_email
+          task_templates!inner (
+            task_id, title, sector, frequency, assignee_name, assignee_email, planner
           )
         `
         )
@@ -137,7 +167,14 @@ export default function BoardPage() {
         .order("due_date", { ascending: true })
         .limit(5000);
 
+      // ✅ filtro automático por Planner
+      if (plannerName) {
+        q = q.eq("task_templates.planner", plannerName);
+      }
+
+      const { data, error } = await q;
       if (error) throw new Error(error.message);
+
       setRuns((data as any) ?? []);
     } catch (e: any) {
       console.error(e);
@@ -151,6 +188,13 @@ export default function BoardPage() {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // ✅ quando planner mudar, recarrega automático (pra trocar cenário sem refresh manual)
+  useEffect(() => {
+    // evita disparar antes de ter lido ctx (mas tanto faz se vier vazio)
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [plannerName]);
 
   const filters = useMemo(() => {
     const sectors = new Set<string>();
@@ -330,11 +374,7 @@ export default function BoardPage() {
         <CardContent className="grid gap-3 md:grid-cols-12 items-end">
           <div className="md:col-span-4">
             <div className="text-xs opacity-70 mb-1">Search</div>
-            <Input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Task_ID or Title..."
-            />
+            <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Task_ID or Title..." />
           </div>
 
           <div className="md:col-span-3">

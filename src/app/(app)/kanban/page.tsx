@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -26,6 +26,7 @@ type Tpl = {
   frequency: string | null;
   assignee_name?: string | null;
   assignee_email?: string | null;
+  planner?: string | null; // ✅ usado no filtro automático
 };
 
 type Person = {
@@ -114,15 +115,19 @@ function StatPill({
 
 export default function KanbanStatusPage() {
   const router = useRouter();
+  const sp = useSearchParams();
 
   const [busy, setBusy] = useState(false);
   const [runs, setRuns] = useState<RunRow[]>([]);
   const [people, setPeople] = useState<Person[]>([]);
 
+  // ✅ planner automático (vem do ?planner= ou do localStorage ctx.plannerName)
+  const [planner, setPlanner] = useState<string>("");
+
   // filtros (estilo /board)
   const [search, setSearch] = useState("");
   const [sector, setSector] = useState("all");
-  const [assigneeEmail, setAssigneeEmail] = useState("all"); // ✅ agora filtra por email
+  const [assigneeEmail, setAssigneeEmail] = useState("all"); // filtra por email
   const [statusFilter, setStatusFilter] = useState("all"); // all|open|in_progress|done
   const [dueFilter, setDueFilter] = useState("all"); // all|overdue|today|next7|later
 
@@ -132,6 +137,24 @@ export default function KanbanStatusPage() {
   const [newDue, setNewDue] = useState<string>(() => ymdLocal(new Date()));
   const [newSector, setNewSector] = useState<string>("Geral");
   const [newAssignee, setNewAssignee] = useState<string>(""); // email
+
+  function readPlannerFromCtx() {
+    const qp = (sp.get("planner") || "").trim();
+    if (qp) return qp;
+
+    try {
+      const ls = (localStorage.getItem("ctx.plannerName") || "").trim();
+      return ls;
+    } catch {
+      return "";
+    }
+  }
+
+  function persistPlannerToCtx(value: string) {
+    try {
+      localStorage.setItem("ctx.plannerName", value);
+    } catch {}
+  }
 
   async function requireUser() {
     const { data } = await supabase.auth.getSession();
@@ -144,7 +167,6 @@ export default function KanbanStatusPage() {
   }
 
   async function loadPeople(userId: string) {
-    // people ativos
     const { data, error } = await supabase
       .from("people")
       .select("name,email,active")
@@ -161,20 +183,31 @@ export default function KanbanStatusPage() {
       const u = await requireUser();
       if (!u) return;
 
-      const { data, error } = await supabase
+      const p = readPlannerFromCtx();
+      setPlanner(p);
+      if (p) persistPlannerToCtx(p);
+
+      // ✅ para filtrar por campo da tabela relacionada, precisa ser INNER
+      let query = supabase
         .from("task_runs")
         .select(
           `
           id, user_id, template_id, due_date, status, done_at,
-          task_templates (
-            task_id, title, sector, frequency, assignee_name, assignee_email
+          task_templates!inner (
+            task_id, title, sector, frequency, assignee_name, assignee_email, planner
           )
         `
         )
-        .eq("user_id", u.id) // ✅ importante
+        .eq("user_id", u.id)
         .order("due_date", { ascending: true })
         .limit(5000);
 
+      // ✅ filtro automático por planner (se existir no ctx)
+      if (p) {
+        query = query.eq("task_templates.planner", p);
+      }
+
+      const { data, error } = await query;
       if (error) throw new Error(error.message);
 
       setRuns((data as any) ?? []);
@@ -187,10 +220,11 @@ export default function KanbanStatusPage() {
     }
   }
 
+  // ✅ sempre que mudar o ?planner= na URL, recarrega e salva no ctx
   useEffect(() => {
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [sp]);
 
   const filters = useMemo(() => {
     const sectors = new Set<string>();
@@ -198,10 +232,7 @@ export default function KanbanStatusPage() {
       const t = tplOf(r);
       if (t?.sector) sectors.add(t.sector);
     }
-
-    return {
-      sectors: Array.from(sectors).sort(),
-    };
+    return { sectors: Array.from(sectors).sort() };
   }, [runs]);
 
   function clearFilters() {
@@ -218,24 +249,19 @@ export default function KanbanStatusPage() {
     return runs.filter((r) => {
       const t = tplOf(r);
 
-      // sector
       if (sector !== "all" && (t?.sector || "") !== sector) return false;
 
-      // assignee (por email)
       const email = (t?.assignee_email || "").trim().toLowerCase();
       if (assigneeEmail !== "all" && email !== assigneeEmail.toLowerCase()) return false;
 
-      // status
       const stNorm = normalizeStatus(r.status || "open");
       if (statusFilter !== "all" && stNorm !== statusFilter) return false;
 
-      // due bucket
       if (dueFilter !== "all") {
         const b = dueBucket(r.due_date);
         if (b !== dueFilter) return false;
       }
 
-      // search
       if (!q) return true;
       const taskId = (t?.task_id || "").toLowerCase();
       const title = (t?.title || "").toLowerCase();
@@ -326,15 +352,16 @@ export default function KanbanStatusPage() {
     const assignee_name = person?.name ?? null;
     const assignee_email = person?.email ?? null;
 
+    // ✅ planner automático: usa o atual (ctx), senão cai no Ad-hoc
+    const plannerName = (planner || readPlannerFromCtx() || "Ad-hoc").trim();
+
     try {
       // 1) tenta reaproveitar template (planner/sector/title)
-      const planner = "Ad-hoc";
-
       const { data: existingTpl, error: findErr } = await supabase
         .from("task_templates")
         .select("id")
         .eq("user_id", u.id)
-        .eq("planner", planner)
+        .eq("planner", plannerName)
         .eq("sector", sec)
         .eq("title", title)
         .limit(1)
@@ -350,7 +377,7 @@ export default function KanbanStatusPage() {
       if (!templateId) {
         const tplPayload: any = {
           user_id: u.id,
-          planner,
+          planner: plannerName,
           sector: sec,
           title,
 
@@ -363,7 +390,7 @@ export default function KanbanStatusPage() {
           assignee_name,
           assignee_email,
 
-          // ✅ não regenerar por Generate Runs
+          // não regenerar por Generate Runs
           active: false,
 
           workday_only: false,
@@ -373,7 +400,7 @@ export default function KanbanStatusPage() {
           due_day: null,
           anchor_date: due,
 
-          task_id: null, // trigger gera
+          task_id: null, // trigger gera (se tiver)
         };
 
         const { data: insTpl, error: insErr } = await supabase
@@ -529,7 +556,7 @@ export default function KanbanStatusPage() {
               Go to Board (Due)
             </Button>
 
-            {/* ✅ New task → cria Run + Template once */}
+            {/* ✅ New task → cria Run + Template once (no planner atual) */}
             <Sheet open={newOpen} onOpenChange={setNewOpen}>
               <SheetTrigger asChild>
                 <Button>New task</Button>
@@ -543,7 +570,11 @@ export default function KanbanStatusPage() {
                 <div className="mt-4 space-y-3">
                   <div>
                     <div className="text-xs opacity-70 mb-1">Title *</div>
-                    <Input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="Ex: Reunião Gerencial" />
+                    <Input
+                      value={newTitle}
+                      onChange={(e) => setNewTitle(e.target.value)}
+                      placeholder="Ex: Reunião Gerencial"
+                    />
                   </div>
 
                   <div>
@@ -558,7 +589,6 @@ export default function KanbanStatusPage() {
                       value={newSector}
                       onChange={(e) => setNewSector(e.target.value)}
                     >
-                      {/* mantém padrão */}
                       <option value="Geral">Geral</option>
                       {filters.sectors.map((s) => (
                         <option key={s} value={s}>
