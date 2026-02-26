@@ -86,22 +86,16 @@ export default function LoginPage() {
   }
 
   async function signIn() {
-    try {
-      setMsg("");
-      setLoading("signin");
+    setMsg("");
+    setLoading("signin");
 
-      const { error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) throw error;
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
 
-      // garante que ele existe no workspace + people
-      await bootstrapUser({ email });
+    setLoading("none");
+    if (error) return setMsg(error.message);
 
-      router.replace("/tasks");
-    } catch (e: any) {
-      setMsg(e?.message || "Erro ao logar.");
-    } finally {
-      setLoading("none");
-    }
+    router.replace("/tasks");
+    router.refresh();
   }
 
   async function signUp() {
