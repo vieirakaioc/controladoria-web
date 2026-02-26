@@ -48,7 +48,7 @@ function parseWeekday(v: any): number | null {
 
   const n = asInt(v);
   if (n !== null) {
-    if (n >= 0 && n <= 6) return n;     // já no padrão JS
+    if (n >= 0 && n <= 6) return n; // já no padrão JS
     if (n >= 1 && n <= 7) return n % 7; // 7 -> 0 (domingo), 1..6 ok
   }
 
@@ -56,13 +56,45 @@ function parseWeekday(v: any): number | null {
   if (!s) return null;
 
   const map: Record<string, number> = {
-    dom: 0, domingo: 0, sunday: 0, sun: 0,
-    seg: 1, segunda: 1, monday: 1, mon: 1,
-    ter: 2, terca: 2, "terca-feira": 2, tuesday: 2, tue: 2,
-    qua: 3, quarta: 3, "quarta-feira": 3, wednesday: 3, wed: 3,
-    qui: 4, quinta: 4, "quinta-feira": 4, thursday: 4, thu: 4,
-    sex: 5, sexta: 5, "sexta-feira": 5, friday: 5, fri: 5,
-    sab: 6, sabado: 6, "sabado-feira": 6, saturday: 6, sat: 6,
+    dom: 0,
+    domingo: 0,
+    sunday: 0,
+    sun: 0,
+
+    seg: 1,
+    segunda: 1,
+    monday: 1,
+    mon: 1,
+
+    ter: 2,
+    terca: 2,
+    "terca-feira": 2,
+    tuesday: 2,
+    tue: 2,
+
+    qua: 3,
+    quarta: 3,
+    "quarta-feira": 3,
+    wednesday: 3,
+    wed: 3,
+
+    qui: 4,
+    quinta: 4,
+    "quinta-feira": 4,
+    thursday: 4,
+    thu: 4,
+
+    sex: 5,
+    sexta: 5,
+    "sexta-feira": 5,
+    friday: 5,
+    fri: 5,
+
+    sab: 6,
+    sabado: 6,
+    "sabado-feira": 6,
+    saturday: 6,
+    sat: 6,
   };
 
   const first = s.split(/[\s\-_/]+/)[0];
@@ -123,10 +155,6 @@ function ymd(dt: Date) {
   const dd = String(dt.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
 }
-function parseISO(iso: string) {
-  const [y, m, d] = iso.split("-").map((x) => parseInt(x, 10));
-  return new Date(y, (m || 1) - 1, d || 1);
-}
 function addDays(dt: Date, days: number) {
   const x = new Date(dt);
   x.setDate(x.getDate() + days);
@@ -143,7 +171,7 @@ function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: num
   const f = stripAccentsLower(freqRaw);
 
   const defaultWorkdayN = diaUtilN ?? 5;
-  const defaultWeekday = diaSemana ?? 1; // ✅ padrão: segunda
+  const defaultWeekday = diaSemana ?? 1; // ✅ padrão: segunda (JS=1)
 
   if (f.includes("diaria")) {
     return { schedule_kind: "daily", schedule_every: 1, due_weekday: null, due_day: null, workday_only: true };
@@ -174,29 +202,24 @@ function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: num
 }
 
 /**
- * ✅ Gera runs AUTOMATICAMENTE para o MÊS do upload
- * - weekly: todas as ocorrências daquele weekday no mês
- * - biweekly: ancorado no anchor_date (simplificado)
- * - daily: todos os dias (se workday_only pula sábado/domingo)
- * - monthly: não gera aqui (você normalmente já traz data no Excel ou usa o gerador de runs)
- * - once: não gera aqui
- *
- * (Como você quer subir todo mês, o importante é o weekly)
+ * ✅ Gera runs AUTOMATICAMENTE para o MÊS do upload (weekly)
  */
 function generateWeeklyRunsForMonth(opts: {
+  workspace_id: string;
   user_id: string;
   template_id: string;
   due_weekday: number; // 0-6
   monthStart: Date;
   monthEnd: Date;
 }) {
-  const { user_id, template_id, due_weekday, monthStart, monthEnd } = opts;
+  const { workspace_id, user_id, template_id, due_weekday, monthStart, monthEnd } = opts;
   const out: any[] = [];
 
   for (let d = new Date(monthStart); d <= monthEnd; d = addDays(d, 1)) {
     if (d.getDay() === due_weekday) {
       const due = ymd(d);
       out.push({
+        workspace_id,
         user_id,
         template_id,
         due_date: due,
@@ -226,9 +249,22 @@ export default function ImportPage() {
     setLog((p) => (p ? p + "\n" + s : s));
   }
 
-  async function upsertPeopleFromListBox(wb: XLSX.WorkBook, userId: string) {
-    const sheetPeople =
-      wb.SheetNames.find((n) => sheetKey(n) === "list_box" || sheetKey(n) === "listbox") || "";
+  async function getWorkspaceIdForUser(userId: string): Promise<string> {
+    const { data, error } = await supabase
+      .from("workspace_members")
+      .select("workspace_id")
+      .eq("user_id", userId)
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw new Error(error.message);
+    const ws = (data as any)?.workspace_id;
+    if (!ws) throw new Error("Usuário sem workspace_id. Verifique workspace_members.");
+    return ws;
+  }
+
+  async function upsertPeopleFromListBox(wb: XLSX.WorkBook, workspaceId: string, userId: string) {
+    const sheetPeople = wb.SheetNames.find((n) => sheetKey(n) === "list_box" || sheetKey(n) === "listbox") || "";
 
     if (!sheetPeople) {
       append("People: aba List_box não encontrada (ok).");
@@ -238,7 +274,7 @@ export default function ImportPage() {
     const wsP = wb.Sheets[sheetPeople];
     const rowsP = XLSX.utils.sheet_to_json<Row>(wsP, { defval: "" });
 
-    const list: Array<{ user_id: string; name: string; email: string; active: boolean }> = [];
+    const list: Array<{ workspace_id: string; user_id: string; name: string; email: string; active: boolean }> = [];
     const seen = new Set<string>();
 
     for (const r of rowsP) {
@@ -247,11 +283,11 @@ export default function ImportPage() {
 
       if (!name || !email) continue;
 
-      const key = `${userId}|${email}`.toLowerCase();
+      const key = `${workspaceId}|${email}`.toLowerCase();
       if (seen.has(key)) continue;
       seen.add(key);
 
-      list.push({ user_id: userId, name, email, active: true });
+      list.push({ workspace_id: workspaceId, user_id: userId, name, email, active: true });
     }
 
     if (list.length === 0) {
@@ -264,7 +300,10 @@ export default function ImportPage() {
     const chunkSize = 200;
     for (let i = 0; i < list.length; i += chunkSize) {
       const chunk = list.slice(i, i + chunkSize);
-      const { error } = await supabase.from("people").upsert(chunk, { onConflict: "user_id,email" });
+
+      // ✅ recomendado: unique por workspace_id + email
+      const { error } = await supabase.from("people").upsert(chunk, { onConflict: "workspace_id,email" });
+
       if (error) throw new Error("People upsert: " + error.message);
     }
 
@@ -287,19 +326,21 @@ export default function ImportPage() {
 
       if (!file) throw new Error("Escolhe o arquivo Excel primeiro.");
 
+      // ✅ workspace do usuário logado (admin/importador)
+      const workspaceId = await getWorkspaceIdForUser(u.id);
+
       append("Lendo Excel...");
       const ab = await file.arrayBuffer();
       const wb = XLSX.read(ab, { type: "array" });
 
       // ✅ 0) People (List_box)
-      await upsertPeopleFromListBox(wb, u.id);
+      await upsertPeopleFromListBox(wb, workspaceId, u.id);
 
-      const sheetTemplates =
-        wb.SheetNames.includes("Lista")
-          ? "Lista"
-          : wb.SheetNames.includes("Templates")
-          ? "Templates"
-          : wb.SheetNames[0];
+      const sheetTemplates = wb.SheetNames.includes("Lista")
+        ? "Lista"
+        : wb.SheetNames.includes("Templates")
+        ? "Templates"
+        : wb.SheetNames[0];
 
       const wsT = wb.Sheets[sheetTemplates];
       const rowsT = XLSX.utils.sheet_to_json<Row>(wsT, { defval: "" });
@@ -342,13 +383,17 @@ export default function ImportPage() {
           const sch = freqToSchedule(frequency, diaUtilN, diaSemana);
 
           return {
+            workspace_id: workspaceId,
             user_id: u.id,
+
             planner,
             sector,
             title,
+
             task_type: task_type || null,
             notes: notes || null,
             priority,
+
             frequency: frequency || null,
             classification: classification || null,
 
@@ -360,7 +405,7 @@ export default function ImportPage() {
             due_weekday: sch.due_weekday,
             due_day: sch.due_day,
 
-            // ✅ anchor_date = 1º dia do mês do upload (pra manter consistência mensal)
+            // ✅ anchor_date = 1º dia do mês do upload
             anchor_date: monthStartISO,
 
             assignee_name: assignee_name || null,
@@ -413,9 +458,10 @@ export default function ImportPage() {
       const chunkSize = 200;
       for (let i = 0; i < templatesPayload.length; i += chunkSize) {
         const chunk = templatesPayload.slice(i, i + chunkSize);
+
         const { error } = await supabase
           .from("task_templates")
-          .upsert(chunk, { onConflict: "user_id,planner,sector,title" });
+          .upsert(chunk, { onConflict: "workspace_id,planner,sector,title" });
 
         if (error) throw new Error(error.message);
         append(`Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`);
@@ -425,7 +471,7 @@ export default function ImportPage() {
       const { data: allTemplates, error: fetchErr } = await supabase
         .from("task_templates")
         .select("id, planner, sector, title, schedule_kind, schedule_every, due_weekday, active")
-        .eq("user_id", u.id);
+        .eq("workspace_id", workspaceId);
 
       if (fetchErr) throw new Error(fetchErr.message);
 
@@ -467,7 +513,9 @@ export default function ImportPage() {
           const status = done_date || statusRaw.toLowerCase().includes("concl") ? "done" : "open";
 
           return {
+            workspace_id: workspaceId,
             user_id: u.id,
+
             template_id: tpl.id,
             due_date,
             start_date: start_date || null,
@@ -490,9 +538,10 @@ export default function ImportPage() {
         const kind = String(tpl.schedule_kind || "");
         if (kind !== "weekly") continue;
 
-        const wd = typeof tpl.due_weekday === "number" ? tpl.due_weekday : 1; // default Monday
+        const wd = typeof tpl.due_weekday === "number" ? tpl.due_weekday : 1; // default Monday (JS=1)
         runsRawAuto.push(
           ...generateWeeklyRunsForMonth({
+            workspace_id: workspaceId,
             user_id: u.id,
             template_id: tpl.id,
             due_weekday: wd,
@@ -537,9 +586,10 @@ export default function ImportPage() {
       if (runsPayload.length > 0) {
         for (let i = 0; i < runsPayload.length; i += chunkSize) {
           const chunk = runsPayload.slice(i, i + chunkSize);
+
           const { error } = await supabase
             .from("task_runs")
-            .upsert(chunk, { onConflict: "template_id,due_date" });
+            .upsert(chunk, { onConflict: "workspace_id,template_id,due_date" });
 
           if (error) throw new Error(error.message);
           append(`Upsert runs: ${Math.min(i + chunkSize, runsPayload.length)}/${runsPayload.length}`);

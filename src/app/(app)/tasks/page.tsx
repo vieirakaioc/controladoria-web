@@ -123,6 +123,7 @@ export default function TasksPage() {
   // states
   const [checkingAuth, setCheckingAuth] = useState(true);
   const [userId, setUserId] = useState<string>("");
+  const [workspaceId, setWorkspaceId] = useState<string>("");
 
   const [q, setQ] = useState(q0);
   const [sector, setSector] = useState(sector0);
@@ -215,6 +216,19 @@ export default function TasksPage() {
     setUrl({ due: "all" });
   }
 
+  async function getWorkspaceIdForUser(uId: string) {
+    const { data, error } = await supabase
+      .from("workspace_members")
+      .select("workspace_id")
+      .eq("user_id", uId)
+      .limit(1)
+      .maybeSingle();
+
+    if (error) throw error;
+    const ws = (data as any)?.workspace_id as string | undefined;
+    return ws || "";
+  }
+
   async function checkSession() {
     const { data, error } = await supabase.auth.getSession();
     if (error) {
@@ -226,7 +240,17 @@ export default function TasksPage() {
       router.replace("/login");
       return;
     }
+
     setUserId(u.id);
+
+    const ws = await getWorkspaceIdForUser(u.id);
+    if (!ws) {
+      setErr("Usuário sem workspace. Verifique workspace_members.");
+      setCheckingAuth(false);
+      return;
+    }
+
+    setWorkspaceId(ws);
     setCheckingAuth(false);
   }
 
@@ -242,7 +266,7 @@ export default function TasksPage() {
     const { data, error } = await supabase
       .from("task_templates")
       .select("id")
-      .eq("user_id", userId)
+      .eq("workspace_id", workspaceId)
       .eq("planner", p);
 
     if (error) throw error;
@@ -251,9 +275,9 @@ export default function TasksPage() {
     return ids;
   }
 
-  // carrega ids do planner (quando user/planner mudar)
+  // carrega ids do planner (quando workspace/planner mudar)
   useEffect(() => {
-    if (!userId) return;
+    if (!workspaceId) return;
 
     (async () => {
       try {
@@ -269,17 +293,17 @@ export default function TasksPage() {
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, plannerName]);
+  }, [workspaceId, plannerName]);
 
   // carrega listas de filtros (Setor / Responsável)
   useEffect(() => {
-    if (!userId) return;
+    if (!workspaceId) return;
 
     (async () => {
       let qTpl = supabase
         .from("task_templates")
         .select("sector, assignee_name, assignee_email")
-        .eq("user_id", userId);
+        .eq("workspace_id", workspaceId);
 
       // ✅ filtra por planner automaticamente (se tiver)
       if (plannerName) qTpl = qTpl.eq("planner", plannerName);
@@ -302,7 +326,7 @@ export default function TasksPage() {
       setSectors(Array.from(sec).sort((a, b) => a.localeCompare(b)));
       setAssignees(Array.from(asg.values()).sort((a, b) => a.email.localeCompare(b.email)));
     })();
-  }, [userId, plannerName]);
+  }, [workspaceId, plannerName]);
 
   // sempre que a URL mudar, reflete no state
   useEffect(() => {
@@ -316,7 +340,7 @@ export default function TasksPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [q0, sector0, assignee0, status0, preset0, from0, to0]);
 
-  // aplica filtros básicos comuns (sem filtro planner no join!)
+  // aplica filtros básicos comuns (sem planner no join!)
   function applyCommonFilters(qry: any) {
     const qq = q.trim();
     if (qq) {
@@ -355,9 +379,9 @@ export default function TasksPage() {
   }
 
   async function fetchRuns() {
-    if (!userId) return;
+    if (!workspaceId) return;
 
-    // se tem plannerName e ainda não carregou ids, espera (evita piscada)
+    // se tem plannerName e ainda não carregou ids, espera
     if (plannerName && plannerTplIds === null) return;
 
     setLoading(true);
@@ -371,7 +395,7 @@ export default function TasksPage() {
         return;
       }
 
-      // 1) QUERY DA LISTA (respeita status)
+      // 1) LISTA
       let listQuery = supabase
         .from("task_runs")
         .select(
@@ -397,10 +421,10 @@ export default function TasksPage() {
           )
         `
         )
-        .eq("user_id", userId)
+        .eq("workspace_id", workspaceId)
         .order("due_date", { ascending: true });
 
-      // ✅ filtro planner SEM join
+      // ✅ planner SEM join
       if (plannerName && plannerTplIds && plannerTplIds.length > 0) {
         listQuery = listQuery.in("template_id", plannerTplIds);
       }
@@ -426,18 +450,17 @@ export default function TasksPage() {
 
       setRuns(normalized);
 
-      // 2) KPI (sempre pega no mês corrente, independente do filtro “duePreset”)
+      // 2) KPI (mês atual)
       const monthFrom = startOfMonthISO(today);
       const monthTo = endOfMonthISO(today);
 
       let kpiQuery = supabase
         .from("task_runs")
         .select("id,due_date,status", { count: "exact" })
-        .eq("user_id", userId)
+        .eq("workspace_id", workspaceId)
         .gte("due_date", monthFrom)
         .lte("due_date", monthTo);
 
-      // ✅ KPI filtra por planner SEM join
       if (plannerName && plannerTplIds && plannerTplIds.length > 0) {
         kpiQuery = kpiQuery.in("template_id", plannerTplIds);
       }
@@ -460,20 +483,22 @@ export default function TasksPage() {
   }
 
   useEffect(() => {
-    if (!userId) return;
+    if (!workspaceId) return;
     fetchRuns();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, q, sector, assignee, status, duePreset, dueFrom, dueTo, plannerName, plannerTplIds]);
+  }, [workspaceId, q, sector, assignee, status, duePreset, dueFrom, dueTo, plannerName, plannerTplIds]);
 
   async function toggleDone(runId: string, done: boolean) {
     const now = done ? new Date().toISOString() : null;
+
     const { error } = await supabase
       .from("task_runs")
       .update({
         status: done ? "done" : "open",
         done_at: now,
       })
-      .eq("id", runId);
+      .eq("id", runId)
+      .eq("workspace_id", workspaceId);
 
     if (error) {
       setErr(error.message);
@@ -484,6 +509,7 @@ export default function TasksPage() {
 
   async function openEdit(runId: string) {
     setErr("");
+
     const { data, error } = await supabase
       .from("task_runs")
       .select(
@@ -494,6 +520,7 @@ export default function TasksPage() {
          )`
       )
       .eq("id", runId)
+      .eq("workspace_id", workspaceId)
       .single();
 
     if (error) {
