@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 
 function isOverdue(dueDate: string) {
   const today = new Date();
@@ -26,6 +27,11 @@ export type TemplateJoin = {
   frequency: string | null;
   classification: string | null;
   planner: string | null;
+
+  // campos “ListBox”
+  workday_only?: boolean | null;
+  due_day?: number | null;
+
   assignee_name: string | null;
   assignee_email: string | null;
 };
@@ -53,20 +59,30 @@ export default function TaskDrawer({
 }) {
   const [saving, setSaving] = useState(false);
 
+  // run
   const [runNotes, setRunNotes] = useState("");
   const [dueDate, setDueDate] = useState("");
   const [status, setStatus] = useState<"open" | "done">("open");
 
+  // template
   const [tplTitle, setTplTitle] = useState("");
   const [tplTaskId, setTplTaskId] = useState("");
   const [tplSector, setTplSector] = useState("");
   const [tplAssignee, setTplAssignee] = useState("");
   const [tplEmail, setTplEmail] = useState("");
 
+  const [tplPlanner, setTplPlanner] = useState("");
+  const [tplPriority, setTplPriority] = useState<string>("");
+  const [tplFrequency, setTplFrequency] = useState("");
+  const [tplClassification, setTplClassification] = useState("");
+  const [tplWorkdayOnly, setTplWorkdayOnly] = useState(false);
+  const [tplDueDay, setTplDueDay] = useState<string>("");
+
   const overdue = useMemo(() => (item?.due_date ? isOverdue(item.due_date) : false), [item?.due_date]);
 
   useEffect(() => {
     if (!item) return;
+
     setRunNotes(item.notes || "");
     setDueDate(item.due_date || "");
     setStatus(item.status);
@@ -77,14 +93,20 @@ export default function TaskDrawer({
     setTplSector(t?.sector || "");
     setTplAssignee(t?.assignee_name || "");
     setTplEmail(t?.assignee_email || "");
+
+    setTplPlanner((t?.planner || "").trim());
+    setTplPriority(t?.priority === null || t?.priority === undefined ? "" : String(t.priority));
+    setTplFrequency(t?.frequency || "");
+    setTplClassification(t?.classification || "");
+    setTplWorkdayOnly(Boolean((t as any)?.workday_only));
+    setTplDueDay((t as any)?.due_day === null || (t as any)?.due_day === undefined ? "" : String((t as any)?.due_day));
   }, [item]);
 
   async function saveRun() {
     if (!item) return;
     setSaving(true);
     try {
-      const done_at =
-        status === "done" ? new Date().toISOString() : null;
+      const done_at = status === "done" ? new Date().toISOString() : null;
 
       const { error } = await supabase
         .from("task_runs")
@@ -115,6 +137,13 @@ export default function TaskDrawer({
           sector: tplSector || null,
           assignee_name: tplAssignee || null,
           assignee_email: tplEmail || null,
+
+          planner: tplPlanner || null,
+          priority: tplPriority ? parseInt(tplPriority, 10) : null,
+          frequency: tplFrequency || null,
+          classification: tplClassification || null,
+          workday_only: tplWorkdayOnly,
+          due_day: tplDueDay ? parseInt(tplDueDay, 10) : null,
         })
         .eq("id", item.template.id);
 
@@ -138,17 +167,12 @@ export default function TaskDrawer({
         <SheetHeader>
           <SheetTitle className="flex items-center gap-2">
             <span className="truncate">{item.template?.title || "Task"}</span>
-            {item.template?.task_id ? (
-              <Badge variant="secondary">{item.template.task_id}</Badge>
-            ) : null}
-            {overdue && item.status === "open" ? (
-              <Badge variant="destructive">Overdue</Badge>
-            ) : null}
+            {item.template?.task_id ? <Badge variant="secondary">{item.template.task_id}</Badge> : null}
+            {overdue && item.status === "open" ? <Badge variant="destructive">Overdue</Badge> : null}
           </SheetTitle>
         </SheetHeader>
 
         <div className="mt-4 space-y-5">
-          {/* Quick actions */}
           <div className="flex gap-2">
             <Button onClick={completeNow} disabled={saving || status === "done"}>
               {status === "done" ? "Completed" : "Complete"}
@@ -165,7 +189,6 @@ export default function TaskDrawer({
             </Button>
           </div>
 
-          {/* Run info */}
           <div className="rounded-lg border p-3 space-y-3">
             <div className="text-xs opacity-70">Run (execution)</div>
 
@@ -193,7 +216,6 @@ export default function TaskDrawer({
             </div>
           </div>
 
-          {/* Template info */}
           <div className="rounded-lg border p-3 space-y-3">
             <div className="text-xs opacity-70">Template (master task)</div>
 
@@ -215,6 +237,66 @@ export default function TaskDrawer({
 
             <div className="grid grid-cols-2 gap-3">
               <div>
+                <div className="text-xs opacity-70 mb-1">Planner</div>
+                <Input value={tplPlanner} onChange={(e) => setTplPlanner(e.target.value)} placeholder="Ex: Financeiro" />
+              </div>
+
+              <div>
+                <div className="text-xs opacity-70 mb-1">Priority</div>
+                <select
+                  className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+                  value={tplPriority}
+                  onChange={(e) => setTplPriority(e.target.value)}
+                >
+                  <option value="">—</option>
+                  <option value="1">1</option>
+                  <option value="2">2</option>
+                  <option value="3">3</option>
+                  <option value="4">4</option>
+                  <option value="5">5</option>
+                </select>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-xs opacity-70 mb-1">Frequency</div>
+                <Input
+                  value={tplFrequency}
+                  onChange={(e) => setTplFrequency(e.target.value)}
+                  placeholder="Mensal / Semanal / Pontual..."
+                />
+              </div>
+
+              <div>
+                <div className="text-xs opacity-70 mb-1">Classification</div>
+                <Input
+                  value={tplClassification}
+                  onChange={(e) => setTplClassification(e.target.value)}
+                  placeholder="Ex: Rotina / Fechamento / Ad-hoc"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 items-end">
+              <div>
+                <div className="text-xs opacity-70 mb-1">Dia útil (N)</div>
+                <Input
+                  type="number"
+                  value={tplDueDay}
+                  onChange={(e) => setTplDueDay(e.target.value)}
+                  placeholder="(blank = use due date)"
+                />
+              </div>
+
+              <div className="flex items-center gap-2 h-10">
+                <Checkbox checked={tplWorkdayOnly} onCheckedChange={(v) => setTplWorkdayOnly(Boolean(v))} />
+                <div className="text-sm">Somente dia útil</div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
                 <div className="text-xs opacity-70 mb-1">Assignee</div>
                 <Input value={tplAssignee} onChange={(e) => setTplAssignee(e.target.value)} />
               </div>
@@ -225,8 +307,9 @@ export default function TaskDrawer({
             </div>
 
             <div className="text-xs opacity-70">
-              {item.template?.frequency ? `Frequency: ${item.template.frequency}` : ""}
-              {item.template?.sector ? ` • Sector: ${item.template.sector}` : ""}
+              {tplFrequency ? `Frequency: ${tplFrequency}` : ""}
+              {tplSector ? ` • Sector: ${tplSector}` : ""}
+              {tplPlanner ? ` • Planner: ${tplPlanner}` : ""}
             </div>
 
             <div className="flex justify-end">

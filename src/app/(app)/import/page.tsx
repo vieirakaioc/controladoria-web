@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 import { supabase } from "@/lib/supabaseClient";
 import { useRouter } from "next/navigation";
@@ -33,23 +33,36 @@ function asInt(v: any): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/**
+ * ✅ Weekday no padrão JS: 0-6
+ * Dom=0, Seg=1, Ter=2, Qua=3, Qui=4, Sex=5, Sab=6
+ *
+ * Aceita:
+ * - "domingo"..."sábado", "dom"..."sab"
+ * - inglês
+ * - número 1-7 (1=Seg ... 7=Dom) -> converte p/ 0-6
+ * - número 0-6 (já padrão JS) -> mantém
+ */
 function parseWeekday(v: any): number | null {
   if (v === null || v === undefined) return null;
 
   const n = asInt(v);
-  if (n && n >= 1 && n <= 7) return n;
+  if (n !== null) {
+    if (n >= 0 && n <= 6) return n;     // já no padrão JS
+    if (n >= 1 && n <= 7) return n % 7; // 7 -> 0 (domingo), 1..6 ok
+  }
 
   const s = stripAccentsLower(v);
   if (!s) return null;
 
   const map: Record<string, number> = {
+    dom: 0, domingo: 0, sunday: 0, sun: 0,
     seg: 1, segunda: 1, monday: 1, mon: 1,
-    ter: 2, terca: 2, tuesday: 2, tue: 2,
-    qua: 3, quarta: 3, wednesday: 3, wed: 3,
-    qui: 4, quinta: 4, thursday: 4, thu: 4,
-    sex: 5, sexta: 5, friday: 5, fri: 5,
-    sab: 6, sabado: 6, saturday: 6, sat: 6,
-    dom: 7, domingo: 7, sunday: 7, sun: 7,
+    ter: 2, terca: 2, "terca-feira": 2, tuesday: 2, tue: 2,
+    qua: 3, quarta: 3, "quarta-feira": 3, wednesday: 3, wed: 3,
+    qui: 4, quinta: 4, "quinta-feira": 4, thursday: 4, thu: 4,
+    sex: 5, sexta: 5, "sexta-feira": 5, friday: 5, fri: 5,
+    sab: 6, sabado: 6, "sabado-feira": 6, saturday: 6, sat: 6,
   };
 
   const first = s.split(/[\s\-_/]+/)[0];
@@ -100,11 +113,37 @@ function runKey(templateId: string, dueDate: string) {
   return `${templateId}|${dueDate}`;
 }
 
+function sheetKey(name: string) {
+  return stripAccentsLower(name).replace(/\s+/g, "").replace(/-/g, "_");
+}
+
+function ymd(dt: Date) {
+  const yyyy = dt.getFullYear();
+  const mm = String(dt.getMonth() + 1).padStart(2, "0");
+  const dd = String(dt.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+function parseISO(iso: string) {
+  const [y, m, d] = iso.split("-").map((x) => parseInt(x, 10));
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+function addDays(dt: Date, days: number) {
+  const x = new Date(dt);
+  x.setDate(x.getDate() + days);
+  return x;
+}
+function startOfMonth(dt: Date) {
+  return new Date(dt.getFullYear(), dt.getMonth(), 1);
+}
+function endOfMonth(dt: Date) {
+  return new Date(dt.getFullYear(), dt.getMonth() + 1, 0);
+}
+
 function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: number | null) {
   const f = stripAccentsLower(freqRaw);
 
   const defaultWorkdayN = diaUtilN ?? 5;
-  const defaultWeekday = diaSemana ?? 5;
+  const defaultWeekday = diaSemana ?? 1; // ✅ padrão: segunda
 
   if (f.includes("diaria")) {
     return { schedule_kind: "daily", schedule_every: 1, due_weekday: null, due_day: null, workday_only: true };
@@ -134,8 +173,42 @@ function freqToSchedule(freqRaw: string, diaUtilN: number | null, diaSemana: num
   return { schedule_kind: "monthly", schedule_every: 1, due_weekday: null, due_day: defaultWorkdayN, workday_only: true };
 }
 
-function sheetKey(name: string) {
-  return stripAccentsLower(name).replace(/\s+/g, "").replace(/-/g, "_");
+/**
+ * ✅ Gera runs AUTOMATICAMENTE para o MÊS do upload
+ * - weekly: todas as ocorrências daquele weekday no mês
+ * - biweekly: ancorado no anchor_date (simplificado)
+ * - daily: todos os dias (se workday_only pula sábado/domingo)
+ * - monthly: não gera aqui (você normalmente já traz data no Excel ou usa o gerador de runs)
+ * - once: não gera aqui
+ *
+ * (Como você quer subir todo mês, o importante é o weekly)
+ */
+function generateWeeklyRunsForMonth(opts: {
+  user_id: string;
+  template_id: string;
+  due_weekday: number; // 0-6
+  monthStart: Date;
+  monthEnd: Date;
+}) {
+  const { user_id, template_id, due_weekday, monthStart, monthEnd } = opts;
+  const out: any[] = [];
+
+  for (let d = new Date(monthStart); d <= monthEnd; d = addDays(d, 1)) {
+    if (d.getDay() === due_weekday) {
+      const due = ymd(d);
+      out.push({
+        user_id,
+        template_id,
+        due_date: due,
+        start_date: due,
+        done_at: null,
+        status: "open",
+        notes: null,
+      });
+    }
+  }
+
+  return out;
 }
 
 export default function ImportPage() {
@@ -144,6 +217,10 @@ export default function ImportPage() {
   const [file, setFile] = useState<File | null>(null);
   const [log, setLog] = useState<string>("");
   const [busy, setBusy] = useState(false);
+
+  const monthStart = useMemo(() => startOfMonth(new Date()), []);
+  const monthEnd = useMemo(() => endOfMonth(new Date()), []);
+  const monthStartISO = useMemo(() => ymd(monthStart), [monthStart]);
 
   function append(s: string) {
     setLog((p) => (p ? p + "\n" + s : s));
@@ -165,10 +242,8 @@ export default function ImportPage() {
     const seen = new Set<string>();
 
     for (const r of rowsP) {
-      const name =
-        norm(r["Responsável"] || r["Responsavel"] || r["Nome"] || r["Name"] || "");
-      const email =
-        norm(r["e-mail"] || r["E-mail"] || r["Email"] || r["email"] || "");
+      const name = norm(r["Responsável"] || r["Responsavel"] || r["Nome"] || r["Name"] || "");
+      const email = norm(r["e-mail"] || r["E-mail"] || r["Email"] || r["email"] || "");
 
       if (!name || !email) continue;
 
@@ -189,10 +264,7 @@ export default function ImportPage() {
     const chunkSize = 200;
     for (let i = 0; i < list.length; i += chunkSize) {
       const chunk = list.slice(i, i + chunkSize);
-      const { error } = await supabase
-        .from("people")
-        .upsert(chunk, { onConflict: "user_id,email" });
-
+      const { error } = await supabase.from("people").upsert(chunk, { onConflict: "user_id,email" });
       if (error) throw new Error("People upsert: " + error.message);
     }
 
@@ -233,6 +305,7 @@ export default function ImportPage() {
       const rowsT = XLSX.utils.sheet_to_json<Row>(wsT, { defval: "" });
 
       append(`Sheet Templates: ${sheetTemplates} (${rowsT.length} linhas)`);
+      append(`Mês do upload: ${ymd(monthStart)} → ${ymd(monthEnd)}`);
 
       // 1) Templates brutos
       const templatesRaw = rowsT
@@ -257,7 +330,10 @@ export default function ImportPage() {
             asInt(r["Dia_Util_N"]) ??
             null;
 
+          // ✅ SUA COLUNA: "Dia Da Semana"
           const diaSemana =
+            parseWeekday(r["Dia Da Semana"]) ??
+            // fallback pra arquivos antigos:
             parseWeekday(r["Dia Semana"]) ??
             parseWeekday(r["Dia_Semana"]) ??
             parseWeekday(r["due_weekday"]) ??
@@ -283,7 +359,9 @@ export default function ImportPage() {
             schedule_every: sch.schedule_every,
             due_weekday: sch.due_weekday,
             due_day: sch.due_day,
-            anchor_date: new Date().toISOString().slice(0, 10),
+
+            // ✅ anchor_date = 1º dia do mês do upload (pra manter consistência mensal)
+            anchor_date: monthStartISO,
 
             assignee_name: assignee_name || null,
             assignee_email: assignee_email || null,
@@ -295,7 +373,7 @@ export default function ImportPage() {
 
       append(`Templates preparados (bruto): ${templatesRaw.length}`);
 
-      // 2) Dedup templates
+      // 2) Dedup templates (dentro do arquivo)
       const tplMap = new Map<string, any>();
       let tplDup = 0;
 
@@ -315,6 +393,12 @@ export default function ImportPage() {
             classification: t.classification ?? prev.classification,
             assignee_name: t.assignee_name ?? prev.assignee_name,
             assignee_email: t.assignee_email ?? prev.assignee_email,
+
+            schedule_kind: t.schedule_kind ?? prev.schedule_kind,
+            schedule_every: t.schedule_every ?? prev.schedule_every,
+            due_weekday: t.due_weekday ?? prev.due_weekday,
+            due_day: t.due_day ?? prev.due_day,
+            workday_only: typeof t.workday_only === "boolean" ? t.workday_only : prev.workday_only,
           });
         } else {
           tplMap.set(k, t);
@@ -322,9 +406,10 @@ export default function ImportPage() {
       }
 
       const templatesPayload = Array.from(tplMap.values());
+      const importedTplKeys = Array.from(tplMap.keys());
       append(`Templates deduplicados: ${templatesPayload.length} (removidos: ${tplDup})`);
 
-      // 3) Upsert templates
+      // 3) Upsert templates (não duplica histórico)
       const chunkSize = 200;
       for (let i = 0; i < templatesPayload.length; i += chunkSize) {
         const chunk = templatesPayload.slice(i, i + chunkSize);
@@ -336,20 +421,20 @@ export default function ImportPage() {
         append(`Upsert templates: ${Math.min(i + chunkSize, templatesPayload.length)}/${templatesPayload.length}`);
       }
 
-      append("Buscando IDs dos templates pra mapear runs...");
+      append("Buscando templates (com schedule) pra mapear IDs e gerar runs do mês...");
       const { data: allTemplates, error: fetchErr } = await supabase
         .from("task_templates")
-        .select("id, planner, sector, title")
+        .select("id, planner, sector, title, schedule_kind, schedule_every, due_weekday, active")
         .eq("user_id", u.id);
 
       if (fetchErr) throw new Error(fetchErr.message);
 
-      const map = new Map<string, string>();
+      const idMap = new Map<string, any>();
       (allTemplates || []).forEach((t: any) => {
-        map.set(tplKey(t.planner, t.sector, t.title), t.id);
+        idMap.set(tplKey(t.planner, t.sector, t.title), t);
       });
 
-      // 4) Runs/histórico (se tiver)
+      // 4) Runs explícitas/histórico (se tiver aba Runs, ou Data Fim na própria Lista)
       let runsRows: Row[] = [];
       const sheetRuns = wb.SheetNames.find((n) => ["Runs", "Execucoes", "Execuções"].includes(n)) || "";
 
@@ -362,15 +447,15 @@ export default function ImportPage() {
         append("Runs: usando as datas da própria Lista (se existirem).");
       }
 
-      const runsRaw = runsRows
+      const runsRawExplicit = runsRows
         .map((r) => {
           const planner = norm(r["Planner Name"] || r["Planner"] || r["planner"]);
           const sector = norm(r["Setor"] || r["Sector"] || r["sector"]);
           const title = norm(r["Atividade"] || r["Title"] || r["title"]);
           if (!planner || !sector || !title) return null;
 
-          const template_id = map.get(tplKey(planner, sector, title));
-          if (!template_id) return null;
+          const tpl = idMap.get(tplKey(planner, sector, title));
+          if (!tpl?.id) return null;
 
           const start_date = toISODate(r["Data Inicial"] || r["Start Date"] || r["start_date"]);
           const due_date = toISODate(r["Data Fim"] || r["Due Date"] || r["due_date"]);
@@ -383,7 +468,7 @@ export default function ImportPage() {
 
           return {
             user_id: u.id,
-            template_id,
+            template_id: tpl.id,
             due_date,
             start_date: start_date || null,
             done_at: done_date ? new Date(done_date + "T12:00:00Z").toISOString() : null,
@@ -393,13 +478,39 @@ export default function ImportPage() {
         })
         .filter(Boolean) as any[];
 
-      append(`Runs detectadas (bruto, com due_date): ${runsRaw.length}`);
+      append(`Runs explícitas (com Data Fim): ${runsRawExplicit.length}`);
 
-      // Dedup runs
+      // 5) ✅ Runs automáticas do mês: apenas pros templates do arquivo que são WEEKLY
+      const runsRawAuto: any[] = [];
+      for (const key of importedTplKeys) {
+        const tpl = idMap.get(key);
+        if (!tpl?.id) continue;
+        if (!tpl.active) continue;
+
+        const kind = String(tpl.schedule_kind || "");
+        if (kind !== "weekly") continue;
+
+        const wd = typeof tpl.due_weekday === "number" ? tpl.due_weekday : 1; // default Monday
+        runsRawAuto.push(
+          ...generateWeeklyRunsForMonth({
+            user_id: u.id,
+            template_id: tpl.id,
+            due_weekday: wd,
+            monthStart,
+            monthEnd,
+          })
+        );
+      }
+
+      append(`Runs automáticas (Semanal) geradas no mês: ${runsRawAuto.length}`);
+
+      // 6) Junta explícitas + automáticas e dedup por template_id+due_date
+      const runsAll = [...runsRawExplicit, ...runsRawAuto];
+
       const runMap = new Map<string, any>();
       let runDup = 0;
 
-      for (const r of runsRaw) {
+      for (const r of runsAll) {
         const k = runKey(r.template_id, r.due_date);
         if (runMap.has(k)) {
           runDup++;
@@ -409,6 +520,7 @@ export default function ImportPage() {
 
           runMap.set(k, {
             ...prev,
+            ...r,
             start_date: prev.start_date ?? r.start_date,
             done_at: betterDoneAt,
             status: betterStatus,
@@ -420,7 +532,7 @@ export default function ImportPage() {
       }
 
       const runsPayload = Array.from(runMap.values());
-      append(`Runs deduplicadas: ${runsPayload.length} (removidos: ${runDup})`);
+      append(`Runs deduplicadas (final): ${runsPayload.length} (removidos: ${runDup})`);
 
       if (runsPayload.length > 0) {
         for (let i = 0; i < runsPayload.length; i += chunkSize) {
@@ -433,11 +545,11 @@ export default function ImportPage() {
           append(`Upsert runs: ${Math.min(i + chunkSize, runsPayload.length)}/${runsPayload.length}`);
         }
       } else {
-        append("Nenhuma run com data encontrada (normal se seu Excel não tem Data Fim preenchida).");
+        append("Nenhuma run gerada/encontrada. (Se semanal, confira 'Frequencia' e 'Dia Da Semana')");
       }
 
       append("✅ Importação concluída!");
-      append("Agora vai em /runs e clica Generate runs (30d) pra criar vencimentos automáticos.");
+      append("Histórico mantido, sem duplicar. Semanal gerado automaticamente no mês.");
     } catch (e: any) {
       append("❌ ERRO: " + (e?.message || String(e)));
     } finally {

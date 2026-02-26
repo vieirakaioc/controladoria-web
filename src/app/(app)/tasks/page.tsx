@@ -7,6 +7,9 @@ import { supabase } from "@/lib/supabaseClient";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import TaskDrawer, { RunItem } from "@/components/tasks/TaskDrawer";
+
+import { ROUTES } from "@/lib/routes";
 
 type Template = {
   id: string;
@@ -18,6 +21,9 @@ type Template = {
   assignee_email: string | null;
   classification: string | null;
   priority: number | null;
+  planner: string | null;
+  workday_only?: boolean | null;
+  due_day?: number | null;
 };
 
 type RunRow = {
@@ -132,11 +138,17 @@ export default function TasksPage() {
   const [runs, setRuns] = useState<Run[]>([]);
   const [kpiRows, setKpiRows] = useState<KpiRow[]>([]);
 
+  const [editOpen, setEditOpen] = useState(false);
+  const [editItem, setEditItem] = useState<RunItem | null>(null);
+
   const [sectors, setSectors] = useState<string[]>([]);
   const [assignees, setAssignees] = useState<Array<{ email: string; name?: string }>>([]);
 
   const today = useMemo(() => localISO(new Date()), []);
   const next7 = useMemo(() => addDaysISO(today, 7), [today]);
+
+  // cache de template ids do planner (pra evitar join e evitar TS deep instantiation)
+  const [plannerTplIds, setPlannerTplIds] = useState<string[] | null>(null);
 
   // ✅ sempre que URL mudar, recalcula planner e persiste se vier por querystring
   useEffect(() => {
@@ -223,6 +235,42 @@ export default function TasksPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  async function getTemplateIdsForPlanner(pName: string) {
+    const p = (pName || "").trim();
+    if (!p) return null;
+
+    const { data, error } = await supabase
+      .from("task_templates")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("planner", p);
+
+    if (error) throw error;
+
+    const ids = (data || []).map((x: any) => x.id).filter(Boolean) as string[];
+    return ids;
+  }
+
+  // carrega ids do planner (quando user/planner mudar)
+  useEffect(() => {
+    if (!userId) return;
+
+    (async () => {
+      try {
+        if (!plannerName) {
+          setPlannerTplIds(null);
+          return;
+        }
+        const ids = await getTemplateIdsForPlanner(plannerName);
+        setPlannerTplIds(ids ?? []);
+      } catch (e: any) {
+        setErr(e.message || "Erro ao carregar planner.");
+        setPlannerTplIds(null);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [userId, plannerName]);
+
   // carrega listas de filtros (Setor / Responsável)
   useEffect(() => {
     if (!userId) return;
@@ -266,50 +314,63 @@ export default function TasksPage() {
     setDueFrom(from0);
     setDueTo(to0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sp]);
+  }, [q0, sector0, assignee0, status0, preset0, from0, to0]);
 
-  function applyCommonFilters(query: any) {
-    // ✅ filtro automático por planner (tabela relacionada)
-    if (plannerName) query = query.eq("task_templates.planner", plannerName);
-
-    // setor / responsavel (filtros em tabela relacionada)
-    if (sector) query = query.eq("task_templates.sector", sector);
-    if (assignee) query = query.eq("task_templates.assignee_email", assignee);
-
-    // busca (related table) — task_id e title
+  // aplica filtros básicos comuns (sem filtro planner no join!)
+  function applyCommonFilters(qry: any) {
     const qq = q.trim();
     if (qq) {
-      query = query.or(`title.ilike.%${qq}%,task_id.ilike.%${qq}%`, {
-        foreignTable: "task_templates",
-      });
+      qry = qry.or(`template.title.ilike.%${qq}%,template.task_id.ilike.%${qq}%`);
     }
 
-    // due/date presets
-    if (duePreset === "overdue") {
-      query = query.lt("due_date", today);
+    const sec = sector.trim();
+    if (sec) {
+      qry = qry.eq("template.sector", sec);
+    }
+
+    const asg = assignee.trim();
+    if (asg) {
+      qry = qry.eq("template.assignee_email", asg);
+    }
+
+    // due date
+    if (duePreset === "custom") {
+      const f = dueFrom.trim();
+      const t = dueTo.trim();
+      if (f) qry = qry.gte("due_date", f);
+      if (t) qry = qry.lte("due_date", t);
+    } else if (duePreset === "overdue") {
+      qry = qry.lt("due_date", today).eq("status", "open");
     } else if (duePreset === "today") {
-      query = query.eq("due_date", today);
+      qry = qry.eq("due_date", today);
     } else if (duePreset === "next7") {
-      query = query.gte("due_date", today).lte("due_date", next7);
+      qry = qry.gte("due_date", today).lte("due_date", next7);
     } else if (duePreset === "month") {
-      const a = startOfMonthISO(today);
-      const b = endOfMonthISO(today);
-      query = query.gte("due_date", a).lte("due_date", b);
-    } else if (duePreset === "custom") {
-      if (dueFrom) query = query.gte("due_date", dueFrom);
-      if (dueTo) query = query.lte("due_date", dueTo);
+      const f = startOfMonthISO(today);
+      const t = endOfMonthISO(today);
+      qry = qry.gte("due_date", f).lte("due_date", t);
     }
 
-    return query;
+    return qry;
   }
 
   async function fetchRuns() {
     if (!userId) return;
 
+    // se tem plannerName e ainda não carregou ids, espera (evita piscada)
+    if (plannerName && plannerTplIds === null) return;
+
     setLoading(true);
     setErr("");
 
     try {
+      // se planner foi definido mas não tem nenhum template, já zera tudo
+      if (plannerName && plannerTplIds && plannerTplIds.length === 0) {
+        setRuns([]);
+        setKpiRows([]);
+        return;
+      }
+
       // 1) QUERY DA LISTA (respeita status)
       let listQuery = supabase
         .from("task_runs")
@@ -330,60 +391,69 @@ export default function TasksPage() {
             assignee_email,
             classification,
             priority,
-            planner
+            planner,
+            workday_only,
+            due_day
           )
         `
         )
         .eq("user_id", userId)
         .order("due_date", { ascending: true });
 
+      // ✅ filtro planner SEM join
+      if (plannerName && plannerTplIds && plannerTplIds.length > 0) {
+        listQuery = listQuery.in("template_id", plannerTplIds);
+      }
+
       listQuery = applyCommonFilters(listQuery);
 
       if (status !== "all") listQuery = listQuery.eq("status", status);
 
-      // 2) QUERY DOS KPIs (ignora status pra contadores ficarem “reais”)
-      let kpiQuery = supabase
-        .from("task_runs")
-        .select(
-          `
-          id,
-          due_date,
-          status,
-          template:task_templates!inner(id, planner)
-        `
-        )
-        .eq("user_id", userId);
+      const { data: listData, error: listErr } = await listQuery;
+      if (listErr) throw listErr;
 
-      kpiQuery = applyCommonFilters(kpiQuery);
-
-      const [{ data: listData, error: listErr }, { data: kpiData, error: kpiErr }] =
-        await Promise.all([listQuery, kpiQuery]);
-
-      if (listErr) throw new Error(listErr.message);
-      if (kpiErr) throw new Error(kpiErr.message);
-
-      const normalized: Run[] = (listData as RunRow[]).map((r) => {
-        const t = Array.isArray(r.template) ? r.template[0] : r.template;
+      const normalized: Run[] = (listData || []).map((r: RunRow) => {
+        const t = Array.isArray(r.template) ? (r.template[0] ?? null) : (r.template as any);
         return {
           id: r.id,
           template_id: r.template_id,
           due_date: r.due_date,
           done_at: r.done_at,
           status: r.status,
-          template: t ?? null,
+          template: t,
         };
       });
 
-      const kpiNormalized: KpiRow[] = ((kpiData || []) as any[]).map((r) => ({
-        id: r.id,
-        due_date: r.due_date,
-        status: r.status,
+      setRuns(normalized);
+
+      // 2) KPI (sempre pega no mês corrente, independente do filtro “duePreset”)
+      const monthFrom = startOfMonthISO(today);
+      const monthTo = endOfMonthISO(today);
+
+      let kpiQuery = supabase
+        .from("task_runs")
+        .select("id,due_date,status", { count: "exact" })
+        .eq("user_id", userId)
+        .gte("due_date", monthFrom)
+        .lte("due_date", monthTo);
+
+      // ✅ KPI filtra por planner SEM join
+      if (plannerName && plannerTplIds && plannerTplIds.length > 0) {
+        kpiQuery = kpiQuery.in("template_id", plannerTplIds);
+      }
+
+      const { data: kpiData, error: kpiErr } = await kpiQuery;
+      if (kpiErr) throw kpiErr;
+
+      const rows: KpiRow[] = (kpiData || []).map((x: any) => ({
+        id: x.id,
+        due_date: x.due_date,
+        status: x.status,
       }));
 
-      setRuns(normalized);
-      setKpiRows(kpiNormalized);
+      setKpiRows(rows);
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(e.message || "Erro ao buscar tarefas.");
     } finally {
       setLoading(false);
     }
@@ -393,218 +463,174 @@ export default function TasksPage() {
     if (!userId) return;
     fetchRuns();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [userId, plannerName, q0, sector0, assignee0, status0, preset0, from0, to0]);
+  }, [userId, q, sector, assignee, status, duePreset, dueFrom, dueTo, plannerName, plannerTplIds]);
 
-  // KPIs baseados no kpiRows (não no runs) pra não “sumir done”
+  async function toggleDone(runId: string, done: boolean) {
+    const now = done ? new Date().toISOString() : null;
+    const { error } = await supabase
+      .from("task_runs")
+      .update({
+        status: done ? "done" : "open",
+        done_at: now,
+      })
+      .eq("id", runId);
+
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+    fetchRuns();
+  }
+
+  async function openEdit(runId: string) {
+    setErr("");
+    const { data, error } = await supabase
+      .from("task_runs")
+      .select(
+        `id,template_id,due_date,done_at,status,notes,
+         template:task_templates(
+           id,task_id,title,sector,task_type,frequency,priority,workday_only,schedule_kind,schedule_every,due_day,due_weekday,anchor_date,active,
+           classification,planner,assignee_name,assignee_email
+         )`
+      )
+      .eq("id", runId)
+      .single();
+
+    if (error) {
+      setErr(error.message);
+      return;
+    }
+
+    const t: any = (data as any)?.template ?? null;
+
+    const item: RunItem = {
+      id: data.id,
+      template_id: data.template_id,
+      due_date: data.due_date,
+      done_at: data.done_at,
+      status: data.status,
+      notes: data.notes ?? null,
+      template: t
+        ? {
+            id: t.id,
+            task_id: t.task_id ?? null,
+            title: t.title ?? "",
+            sector: t.sector ?? null,
+            task_type: t.task_type ?? null,
+            priority: t.priority ?? null,
+            frequency: t.frequency ?? null,
+            classification: t.classification ?? null,
+            planner: t.planner ?? null,
+            workday_only: t.workday_only ?? false,
+            due_day: t.due_day ?? null,
+            assignee_name: t.assignee_name ?? null,
+            assignee_email: t.assignee_email ?? null,
+          }
+        : null,
+    };
+
+    setEditItem(item);
+    setEditOpen(true);
+  }
+
   const kpis = useMemo(() => {
     const total = kpiRows.length;
-    const open = kpiRows.filter((r) => r.status === "open").length;
     const done = kpiRows.filter((r) => r.status === "done").length;
+    const open = total - done;
     const overdue = kpiRows.filter((r) => r.status === "open" && r.due_date < today).length;
-    const dueToday = kpiRows.filter((r) => r.status === "open" && r.due_date === today).length;
-    const next7c = kpiRows.filter((r) => r.status === "open" && r.due_date >= today && r.due_date <= next7).length;
-    return { total, open, done, overdue, dueToday, next7: next7c };
-  }, [kpiRows, today, next7]);
+    return { total, done, open, overdue };
+  }, [kpiRows, today]);
 
-  function goKpi(kind: "total" | "open" | "overdue" | "today" | "next7" | "done") {
-    if (kind === "total") return setUrl({ status: "all", due: "all" });
-    if (kind === "open") return setUrl({ status: "open", due: "all" });
-    if (kind === "done") return setUrl({ status: "done", due: "all" });
-    if (kind === "overdue") return setUrl({ status: "open", due: "overdue" });
-    if (kind === "today") return setUrl({ status: "open", due: "today" });
-    if (kind === "next7") return setUrl({ status: "open", due: "next7" });
-  }
-
-  function kpiActive(kind: "total" | "open" | "overdue" | "today" | "next7" | "done") {
-    if (kind === "total") return status === "all" && duePreset === "all";
-    if (kind === "open") return status === "open" && duePreset === "all";
-    if (kind === "done") return status === "done" && duePreset === "all";
-    if (kind === "overdue") return status === "open" && duePreset === "overdue";
-    if (kind === "today") return status === "open" && duePreset === "today";
-    if (kind === "next7") return status === "open" && duePreset === "next7";
-    return false;
-  }
-
-  async function toggleDone(runId: string, makeDone: boolean) {
-    // otimista (pra ficar rápido)
-    setRuns((prev) =>
-      prev.map((r) =>
-        r.id === runId
-          ? {
-              ...r,
-              status: makeDone ? "done" : "open",
-              done_at: makeDone ? new Date().toISOString() : null,
-            }
-          : r
-      )
-    );
-
-    setKpiRows((prev) =>
-      prev.map((r) =>
-        r.id === runId
-          ? {
-              ...r,
-              status: makeDone ? "done" : "open",
-            }
-          : r
-      )
-    );
-
-    const patch = makeDone
-      ? { status: "done", done_at: new Date().toISOString() }
-      : { status: "open", done_at: null };
-
-    const { error } = await supabase.from("task_runs").update(patch).eq("id", runId);
-    if (error) {
-      await fetchRuns();
-      alert("Erro ao atualizar: " + error.message);
-    }
-  }
-
-  function clearFilters() {
-    setUrl({
-      q: "",
-      sector: "",
-      assignee: "",
-      status: "open",
-      due: "all",
-      from: "",
-      to: "",
-    });
-  }
-
-  if (checkingAuth) {
-    return (
-      <div className="min-h-screen flex items-center justify-center text-sm opacity-70">
-        Loading...
-      </div>
-    );
-  }
+  if (checkingAuth) return <div className="p-8">Loading...</div>;
 
   return (
-    <div className="space-y-4">
-      <div className="flex items-start justify-between gap-3 flex-wrap">
-        <div>
-          <h1 className="text-xl font-semibold">Tasks</h1>
-          <div className="text-sm opacity-70">
-            Lista de execuções (runs) com filtros estilo ClickUp.
-          </div>
+    <div className="p-6 space-y-4">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <div className="flex items-center gap-2">
+          <h1 className="text-2xl font-semibold">Tasks</h1>
+          {plannerName ? (
+            <span className={cx("text-xs px-2 py-1 rounded border", badgeClass("chip"))}>Planner: {plannerName}</span>
+          ) : null}
         </div>
 
-        {/* KPIs CLICÁVEIS */}
-        <div className="flex items-center gap-2 flex-wrap">
-          <button
-            type="button"
-            onClick={() => goKpi("total")}
-            className={cx(
-              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
-              badgeClass("chip"),
-              kpiActive("total") && "ring-2 ring-primary/40"
-            )}
-            title="Show everything (status=all, due=all)"
-          >
-            Total: <b>{kpis.total}</b>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => goKpi("open")}
-            className={cx(
-              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
-              badgeClass("open"),
-              kpiActive("open") && "ring-2 ring-primary/40"
-            )}
-            title="Show open tasks"
-          >
-            Open: <b>{kpis.open}</b>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => goKpi("overdue")}
-            className={cx(
-              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
-              badgeClass("overdue"),
-              kpiActive("overdue") && "ring-2 ring-primary/40"
-            )}
-            title="Show overdue open tasks"
-          >
-            Overdue: <b>{kpis.overdue}</b>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => goKpi("today")}
-            className={cx(
-              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
-              badgeClass("chip"),
-              kpiActive("today") && "ring-2 ring-primary/40"
-            )}
-            title="Show open tasks due today"
-          >
-            Today: <b>{kpis.dueToday}</b>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => goKpi("next7")}
-            className={cx(
-              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
-              badgeClass("chip"),
-              kpiActive("next7") && "ring-2 ring-primary/40"
-            )}
-            title="Show open tasks due in the next 7 days"
-          >
-            Next 7d: <b>{kpis.next7}</b>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => goKpi("done")}
-            className={cx(
-              "text-xs px-2 py-1 rounded border transition hover:bg-muted/60",
-              badgeClass("done"),
-              kpiActive("done") && "ring-2 ring-primary/40"
-            )}
-            title="Show done tasks"
-          >
-            Done: <b>{kpis.done}</b>
-          </button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" onClick={() => router.push(ROUTES.KANBAN)}>
+            Kanban
+          </Button>
+          <Button variant="outline" onClick={() => router.push(ROUTES.BOARD)}>
+            Board
+          </Button>
         </div>
       </div>
 
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Filters</CardTitle>
-        </CardHeader>
+      {/* KPIs */}
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+        <Card>
+          <CardHeader className="py-3">
+            <CardTitle className="text-sm opacity-80">Total (mês)</CardTitle>
+          </CardHeader>
+          <CardContent className="pb-4">
+            <div className="text-3xl font-semibold tabular-nums">{kpis.total}</div>
+          </CardContent>
+        </Card>
 
-        <CardContent className="space-y-3">
-          <div className="grid grid-cols-12 gap-2">
-            {/* Search */}
-            <div className="col-span-12 lg:col-span-4">
-              <div className="text-xs opacity-70 mb-1">Search (Task_ID or Title)</div>
-              <div className="flex gap-2">
-                <Input
-                  value={q}
-                  onChange={(e) => setQ(e.target.value)}
-                  placeholder="ex: CL-DE-000011 ou conciliação..."
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") setUrl({ q: q.trim() });
-                  }}
-                />
-                <Button variant="secondary" onClick={() => setUrl({ q: q.trim() })}>
-                  Apply
-                </Button>
-              </div>
+        <Card>
+          <CardHeader className="py-3">
+            <CardTitle className="text-sm opacity-80">Done (mês)</CardTitle>
+          </CardHeader>
+          <CardContent className="pb-4">
+            <div className="text-3xl font-semibold tabular-nums text-emerald-700">{kpis.done}</div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="py-3">
+            <CardTitle className="text-sm opacity-80">Open (mês)</CardTitle>
+          </CardHeader>
+          <CardContent className="pb-4">
+            <div className="text-3xl font-semibold tabular-nums text-amber-700">{kpis.open}</div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader className="py-3">
+            <CardTitle className="text-sm opacity-80">Overdue (mês)</CardTitle>
+          </CardHeader>
+          <CardContent className="pb-4">
+            <div className="text-3xl font-semibold tabular-nums text-rose-700">{kpis.overdue}</div>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* Filters */}
+      <Card>
+        <CardHeader className="py-3">
+          <CardTitle className="text-sm opacity-80">Filters</CardTitle>
+        </CardHeader>
+        <CardContent className="pb-4 space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+            <div>
+              <div className="text-xs opacity-70 mb-1">Search (title / task_id)</div>
+              <Input
+                value={q}
+                onChange={(e) => {
+                  setQ(e.target.value);
+                  setUrl({ q: e.target.value });
+                }}
+                placeholder="ex: fechamento, TSK-001..."
+              />
             </div>
 
-            {/* Sector */}
-            <div className="col-span-12 sm:col-span-6 lg:col-span-2">
+            <div>
               <div className="text-xs opacity-70 mb-1">Sector</div>
               <select
-                value={sector}
-                onChange={(e) => setUrl({ sector: e.target.value })}
                 className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+                value={sector}
+                onChange={(e) => {
+                  setSector(e.target.value);
+                  setUrl({ sector: e.target.value });
+                }}
               >
                 <option value="">All</option>
                 {sectors.map((s) => (
@@ -615,189 +641,203 @@ export default function TasksPage() {
               </select>
             </div>
 
-            {/* Assignee */}
-            <div className="col-span-12 sm:col-span-6 lg:col-span-3">
+            <div>
               <div className="text-xs opacity-70 mb-1">Assignee</div>
               <select
-                value={assignee}
-                onChange={(e) => setUrl({ assignee: e.target.value })}
                 className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+                value={assignee}
+                onChange={(e) => {
+                  setAssignee(e.target.value);
+                  setUrl({ assignee: e.target.value });
+                }}
               >
                 <option value="">All</option>
                 {assignees.map((a) => (
                   <option key={a.email} value={a.email}>
-                    {a.name ? `${a.name} — ${a.email}` : a.email}
+                    {a.name ? `${a.name} (${a.email})` : a.email}
                   </option>
                 ))}
               </select>
             </div>
 
-            {/* Status */}
-            <div className="col-span-12 sm:col-span-6 lg:col-span-1">
+            <div>
               <div className="text-xs opacity-70 mb-1">Status</div>
               <select
-                value={status}
-                onChange={(e) => setUrl({ status: e.target.value })}
                 className="w-full h-10 rounded-md border bg-background px-3 text-sm"
+                value={status}
+                onChange={(e) => {
+                  setStatus(e.target.value as any);
+                  setUrl({ status: e.target.value });
+                }}
               >
+                <option value="all">All</option>
                 <option value="open">Open</option>
                 <option value="done">Done</option>
-                <option value="all">All</option>
               </select>
             </div>
+          </div>
 
-            {/* Due preset */}
-            <div className="col-span-12 sm:col-span-6 lg:col-span-2">
-              <div className="text-xs opacity-70 mb-1">Due</div>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 items-end">
+            <div>
+              <div className="text-xs opacity-70 mb-1">Due preset</div>
               <select
+                className="w-full h-10 rounded-md border bg-background px-3 text-sm"
                 value={duePreset}
                 onChange={(e) => applyDuePreset(e.target.value)}
-                className="w-full h-10 rounded-md border bg-background px-3 text-sm"
               >
                 <option value="all">All</option>
                 <option value="overdue">Overdue</option>
                 <option value="today">Today</option>
                 <option value="next7">Next 7 days</option>
                 <option value="month">This month</option>
-                <option value="custom">Custom range</option>
+                <option value="custom">Custom</option>
               </select>
             </div>
 
-            {/* Custom range */}
-            {duePreset === "custom" && (
-              <div className="col-span-12 lg:col-span-4">
-                <div className="text-xs opacity-70 mb-1">Custom range</div>
-                <div className="flex gap-2 items-center">
+            {duePreset === "custom" ? (
+              <>
+                <div>
+                  <div className="text-xs opacity-70 mb-1">From</div>
                   <Input
                     type="date"
                     value={dueFrom}
                     onChange={(e) => {
                       setDueFrom(e.target.value);
-                      setUrl({ due: "custom", from: e.target.value, to: dueTo });
+                      setUrl({ from: e.target.value, due: "custom" });
                     }}
                   />
-                  <span className="text-xs opacity-60">to</span>
+                </div>
+
+                <div>
+                  <div className="text-xs opacity-70 mb-1">To</div>
                   <Input
                     type="date"
                     value={dueTo}
                     onChange={(e) => {
                       setDueTo(e.target.value);
-                      setUrl({ due: "custom", from: dueFrom, to: e.target.value });
+                      setUrl({ to: e.target.value, due: "custom" });
                     }}
                   />
                 </div>
+
+                <div className="flex justify-end">
+                  <Button variant="outline" onClick={() => fetchRuns()} disabled={loading}>
+                    Apply
+                  </Button>
+                </div>
+              </>
+            ) : (
+              <div className="md:col-span-3 flex justify-end">
+                <Button variant="outline" onClick={() => fetchRuns()} disabled={loading}>
+                  Refresh
+                </Button>
               </div>
             )}
-
-            {/* Actions */}
-            <div className="col-span-12 flex items-end gap-2">
-              <Button variant="outline" onClick={clearFilters}>
-                Clear filters
-              </Button>
-              <Button variant="outline" onClick={fetchRuns} disabled={loading}>
-                Refresh
-              </Button>
-            </div>
           </div>
 
-          {err && (
-            <div className="text-sm text-rose-600 border border-rose-200 bg-rose-50 rounded-md p-3">
-              {err}
-            </div>
-          )}
+          {err ? <div className="text-sm text-rose-600">{err}</div> : null}
         </CardContent>
       </Card>
 
+      {/* List */}
       <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Results</CardTitle>
+        <CardHeader className="py-3">
+          <CardTitle className="text-sm opacity-80">
+            List {loading ? <span className="opacity-60"> (loading...)</span> : null}
+          </CardTitle>
         </CardHeader>
+        <CardContent className="pb-4">
+          <div className="overflow-auto border rounded-lg">
+            <table className="min-w-[900px] w-full text-sm">
+              <thead className="bg-muted/40">
+                <tr className="text-left">
+                  <th className="p-3">Due</th>
+                  <th className="p-3">Status</th>
+                  <th className="p-3">Task</th>
+                  <th className="p-3">Sector</th>
+                  <th className="p-3">Frequency</th>
+                  <th className="p-3">Classification</th>
+                  <th className="p-3">Priority</th>
+                  <th className="p-3">Assignee</th>
+                  <th className="p-3">Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {runs.map((r) => {
+                  const t = r.template;
+                  const overdue = r.status === "open" && r.due_date < today;
 
-        <CardContent>
-          {loading ? (
-            <div className="text-sm opacity-70">Loading...</div>
-          ) : runs.length === 0 ? (
-            <div className="text-sm opacity-70">Nada encontrado com esses filtros.</div>
-          ) : (
-            <div className="overflow-auto border rounded-md">
-              <table className="min-w-[980px] w-full text-sm">
-                <thead className="bg-muted/50">
-                  <tr className="text-left">
-                    <th className="p-3">Status</th>
-                    <th className="p-3">Due</th>
-                    <th className="p-3">Task_ID</th>
-                    <th className="p-3">Title</th>
-                    <th className="p-3">Sector</th>
-                    <th className="p-3">Frequency</th>
-                    <th className="p-3">Assignee</th>
-                    <th className="p-3">Action</th>
-                  </tr>
-                </thead>
+                  return (
+                    <tr key={r.id} className="border-t">
+                      <td className="p-3">
+                        <span
+                          className={cx(
+                            "inline-flex px-2 py-1 rounded border text-xs tabular-nums",
+                            overdue ? badgeClass("overdue") : badgeClass(r.status)
+                          )}
+                        >
+                          {r.due_date}
+                        </span>
+                      </td>
 
-                <tbody>
-                  {runs.map((r) => {
-                    const t = r.template;
-                    const overdue = r.status === "open" && r.due_date < today;
+                      <td className="p-3">
+                        <span className={cx("inline-flex px-2 py-1 rounded border text-xs", badgeClass(overdue ? "overdue" : r.status))}>
+                          {overdue ? "overdue" : r.status}
+                        </span>
+                      </td>
 
-                    return (
-                      <tr key={r.id} className="border-t">
-                        <td className="p-3">
-                          <span
-                            className={cx(
-                              "text-xs px-2 py-1 rounded border",
-                              overdue ? badgeClass("overdue") : badgeClass(r.status)
-                            )}
-                          >
-                            {overdue ? "OVERDUE" : r.status.toUpperCase()}
-                          </span>
-                        </td>
+                      <td className="p-3">
+                        <div className="font-medium leading-snug break-words">{t?.title || ""}</div>
+                        <div className="text-xs opacity-70">{t?.task_id || ""}</div>
+                      </td>
 
-                        <td className="p-3 font-medium">{r.due_date}</td>
+                      <td className="p-3">{t?.sector || ""}</td>
+                      <td className="p-3">{t?.frequency || ""}</td>
+                      <td className="p-3">{t?.classification || ""}</td>
+                      <td className="p-3">{t?.priority ?? ""}</td>
 
-                        <td className="p-3">
-                          <span className="font-mono text-xs">{t?.task_id ?? "—"}</span>
-                        </td>
+                      <td className="p-3">
+                        <div className="text-xs">{t?.assignee_name || ""}</div>
+                        <div className="text-xs opacity-70">{t?.assignee_email || ""}</div>
+                      </td>
 
-                        <td className="p-3">
-                          <div className="font-medium">{t?.title ?? "—"}</div>
-                          <div className="text-xs opacity-70">
-                            {t?.classification ? `Class: ${t.classification}` : ""}
-                          </div>
-                        </td>
+                      <td className="p-3">
+                        <div className="flex gap-2">
+                          <Button size="sm" variant="outline" className="h-8" onClick={() => openEdit(r.id)}>
+                            Edit
+                          </Button>
 
-                        <td className="p-3">{t?.sector ?? "—"}</td>
-                        <td className="p-3">{t?.frequency ?? "—"}</td>
-
-                        <td className="p-3">
-                          <div className="text-sm">{t?.assignee_name || "—"}</div>
-                          <div className="text-xs opacity-70">{t?.assignee_email || ""}</div>
-                        </td>
-
-                        <td className="p-3">
                           {r.status === "open" ? (
                             <Button size="sm" onClick={() => toggleDone(r.id, true)} className="h-8">
                               Complete
                             </Button>
                           ) : (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              onClick={() => toggleDone(r.id, false)}
-                              className="h-8"
-                            >
+                            <Button size="sm" variant="outline" onClick={() => toggleDone(r.id, false)} className="h-8">
                               Reopen
                             </Button>
                           )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          {runs.length === 0 && !loading ? <div className="text-sm opacity-70 mt-3">No tasks found.</div> : null}
         </CardContent>
       </Card>
+
+      <TaskDrawer
+        open={editOpen}
+        onOpenChange={(v) => {
+          setEditOpen(v);
+          if (!v) setEditItem(null);
+        }}
+        item={editItem}
+        onChanged={fetchRuns}
+      />
     </div>
   );
 }
